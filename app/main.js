@@ -15,8 +15,9 @@ function argValue(name) {
   return hit ? hit.slice(name.length + 3) : undefined
 }
 
-// Keep every write inside one directory (owner rule: nothing outside ~/Desktop).
-const baseDir = argValue('base-dir') || path.join(app.getPath('home'), 'Desktop', 'OrcaHS-data')
+// Keep every write inside one directory. Default is the standard per-user app data folder;
+// --base-dir=<dir> moves all of it (profile, logs, server list) somewhere else, e.g. a USB stick.
+const baseDir = argValue('base-dir') || path.join(app.getPath('appData'), pkg.productName)
 const userData = path.join(baseDir, 'userdata')
 const logsDir = path.join(baseDir, 'logs')
 for (const dir of [userData, logsDir]) fs.mkdirSync(dir, { recursive: true })
