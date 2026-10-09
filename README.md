@@ -18,6 +18,7 @@ app/
   pair-link.js        把 orca://pair 連結 / browser URL / 裸 code 轉成 web client URL
   clipboard-policy.js 剪貼簿寫入的驗證規則
   prompt.html         首次啟動的貼連結頁
+  offline.html        server 連不上時的重試 / 換 server 頁
   package.json        Electron 入口宣告
 test/                 node:test 單元測試
 build.sh              在現代 Mac 上下載 Electron 26、驗 checksum、組 OrcaHS.app、打 zip
@@ -47,6 +48,12 @@ open -na ~/Desktop/OrcaHS/OrcaHS.app --args --base-dir=$HOME/Desktop/OrcaHS/data
 
 四種輸入是同一份 payload，`app/pair-link.js` 負責轉換。`--url=` 參數與 `data/server-url.txt` 也接受同樣輸入。
 server 頁載入後只把 origin 寫回 `server-url.txt`（mode 600）；pairing code 留在頁面的 localStorage，與上游 web client 行為相同。
+
+## 連不上 server 時
+
+主頁載入失敗（連線被拒、逾時、renderer 當掉）會切到殼自己的 `offline.html`：顯示錯誤碼、每 10 秒自動探測一次
+server、可手動重試或回到貼連結頁。失敗的位址不會被記進 `server-url.txt`。
+server 執行中斷線（WebSocket 掉線）由 Orca 自己的 UI 處理重連，殼不介入。
 
 ## 測試
 

@@ -99,16 +99,35 @@ function createWindow() {
     return { ok: true }
   })
   wc.on('console-message', (_e, level, message, line, sourceId) => {
-    log(`[console:${level}] ${message} (${sourceId}:${line})`)
+    log(`[console:${level}] ${message} (${String(sourceId).split(/[#?]/)[0]}:${line})`)
   })
-  wc.on('did-fail-load', (_e, code, desc, url) => log(`[did-fail-load] ${code} ${desc} ${String(url).split(/[#?]/)[0]}`))
+
+  // 4. Offline page: when the server page itself fails to load, show the shell's own page with
+  // retry / change-server instead of Chromium's error page. -3 is ERR_ABORTED (navigation
+  // superseded), which is not a failure.
+  let lastServerOrigin = null
+  let lastFailedUrl = null
+  wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    const shown = String(url).split(/[#?]/)[0]
+    log(`[did-fail-load] ${code} ${desc} ${shown}`)
+    if (!isMainFrame || code === -3 || !/^https?:/.test(shown)) return
+    lastFailedUrl = String(url)
+    let origin = lastServerOrigin
+    try { origin = new URL(shown).origin } catch {}
+    const params = new URLSearchParams({ origin: origin || '', code: String(code), desc })
+    win.loadFile(path.join(__dirname, 'offline.html'), { hash: params.toString() })
+  })
+  wc.on('render-process-gone', (_e, d) => {
+    log(`[render-process-gone] ${JSON.stringify(d)}`)
+    const params = new URLSearchParams({ origin: lastServerOrigin || '', code: 'renderer', desc: d && d.reason || 'renderer exited' })
+    win.loadFile(path.join(__dirname, 'offline.html'), { hash: params.toString() })
+  })
   wc.on('did-finish-load', () => {
     // Never log the hash or query: the pairing payload carries the runtime token.
     let shown = wc.getURL()
     try { const u = new URL(shown); shown = `${u.origin}${u.pathname}` } catch {}
     log(`[did-finish-load] ${shown}`)
   })
-  wc.on('render-process-gone', (_e, d) => log(`[render-process-gone] ${JSON.stringify(d)}`))
   wc.on('will-navigate', (_e, url) => log(`[will-navigate] ${url.split(/[#?]/)[0]}`))
   wc.setWindowOpenHandler(({ url }) => {
     log(`[window-open blocked] ${url}`)
@@ -163,8 +182,12 @@ function createWindow() {
   wc.on('did-finish-load', () => {
     const current = wc.getURL()
     if (!/^https?:/.test(current)) return
+    // Chromium's own error page also finishes loading; never remember a URL that just failed.
+    if (current === lastFailedUrl) { lastFailedUrl = null; return }
     const origin = persistableUrl(current)
-    if (origin) { try { fs.writeFileSync(urlFile, origin, { mode: 0o600 }) } catch {} }
+    if (!origin) return
+    try { lastServerOrigin = new URL(current).origin } catch {}
+    try { fs.writeFileSync(urlFile, origin, { mode: 0o600 }) } catch {}
   })
   if (targetUrl) {
     win.loadURL(targetUrl)
