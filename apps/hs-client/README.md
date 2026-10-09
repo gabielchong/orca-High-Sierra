@@ -39,6 +39,8 @@ After the server page loads, only the server origin is written back to `server-u
 
 - `pdf.worker.min-*.mjs` runs in a Worker where the preload polyfills do not apply and it
   uses `Promise.withResolvers`; PDF preview is expected to fail.
-- Plain `http://` is not a secure context: `crypto.subtle` and `navigator.clipboard` are
-  unavailable, and the App chunk calls `navigator.clipboard.writeText` unguarded.
+- Plain `http://` is not a secure context, so Chromium removes `navigator.clipboard` and
+  `crypto.subtle`. The shell installs a write-only clipboard shim: `writeText` is forwarded to
+  the main process, which checks sender, main frame, exact server origin, size and rate
+  (`app/clipboard-policy.js`). `readText`/`read`/`write` are rejected; paste with Cmd+V.
 - Electron 26 is end of life; keep the client on a private network path only.

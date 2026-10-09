@@ -1,8 +1,9 @@
 // Orca High Sierra PoC shell: Electron 26 thin client that only loads a remote Orca server URL.
-const { app, BrowserWindow, shell } = require('electron')
+const { app, BrowserWindow, shell, ipcMain, clipboard } = require('electron')
 const fs = require('fs')
 const path = require('path')
 const { resolvePairInput, persistableUrl } = require('./pair-link')
+const { createClipboardPolicy } = require('./clipboard-policy')
 
 const argv = process.argv.slice(1)
 function argValue(name) {
@@ -74,6 +75,29 @@ function createWindow() {
     }
   })
   const wc = win.webContents
+
+  // The only privileged bridge: write-only clipboard for the active server origin (see preload.js).
+  let allowedOrigin = null
+  wc.on('did-navigate', (_e, url) => {
+    try { const u = new URL(url); allowedOrigin = /^https?:$/.test(u.protocol) ? u.origin : null } catch { allowedOrigin = null }
+  })
+  const clipboardPolicy = createClipboardPolicy()
+  ipcMain.handle('orca-hs:clipboard-write-text', (event, text) => {
+    const verdict = clipboardPolicy({
+      senderIsWindow: event.sender === wc,
+      frameIsMain: event.senderFrame === wc.mainFrame,
+      frameUrl: event.senderFrame ? event.senderFrame.url : '',
+      allowedOrigin,
+      text
+    })
+    if (!verdict.ok) {
+      log(`[clipboard] denied: ${verdict.reason}`)
+      return verdict
+    }
+    clipboard.writeText(text)
+    log(`[clipboard] wrote ${text.length} chars`)
+    return { ok: true }
+  })
   wc.on('console-message', (_e, level, message, line, sourceId) => {
     log(`[console:${level}] ${message} (${sourceId}:${line})`)
   })
@@ -112,6 +136,8 @@ function createWindow() {
     try {
       const r = await wc.executeJavaScript(`(() => ({
         polyfilled: window.__orcaHsPolyfills === true,
+        clipboardShim: window.__orcaHsClipboardShim || null,
+        clipboardApi: typeof (navigator.clipboard && navigator.clipboard.writeText),
         webgl2: !!document.createElement('canvas').getContext('webgl2'),
         webgl1: !!document.createElement('canvas').getContext('webgl'),
         offscreenCanvas: typeof OffscreenCanvas !== 'undefined',
