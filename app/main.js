@@ -329,9 +329,14 @@ function createWindow() {
     saveServers(serverList)
   })
 
-  // --- IPC for the shell's own pages (exact file URLs, main frame, this window only)
+  let toast = null // update notice window, created on demand (see showToast)
+
+  // --- IPC for the shell's own pages (exact file URLs, main frame, our windows only)
+  // Accepts the main window and the update toast window; both must be on a shell page, main frame.
   function fromShellPage(event) {
-    return event.sender === wc && event.senderFrame === wc.mainFrame && navPolicy.isShellPage(event.senderFrame.url)
+    const sender = event.sender
+    const isOurs = sender === wc || (toast && !toast.isDestroyed() && sender === toast.webContents)
+    return !!isOurs && event.senderFrame === sender.mainFrame && navPolicy.isShellPage(event.senderFrame.url)
   }
   ipcMain.handle('orca-hs:servers-list', (event) => (fromShellPage(event) ? serverList : []))
   ipcMain.handle('orca-hs:servers-remove', async (event, origin) => {
@@ -411,7 +416,6 @@ function createWindow() {
   // --- Update toast: a small frameless window pinned to the bottom-right of the main window,
   // like the official client's. "Download and Install" runs app/updater.js; "Later" hides it
   // until the next launch. It is a separate window, so it sits over the remote page too.
-  let toast = null
   let progress = { stage: 'idle' }
   function toastSend(channel, payload) { if (toast && !toast.isDestroyed()) toast.webContents.send(channel, payload) }
   function positionToast() {
