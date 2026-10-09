@@ -6,6 +6,7 @@ const { resolvePairInput, persistableUrl } = require('./pair-link')
 const { createClipboardPolicy } = require('./clipboard-policy')
 
 const argv = process.argv.slice(1)
+const debug = argv.includes('--hs-debug')
 function argValue(name) {
   const hit = argv.find((a) => a.startsWith(`--${name}=`))
   return hit ? hit.slice(name.length + 3) : undefined
@@ -99,7 +100,7 @@ function createWindow() {
     return { ok: true }
   })
   wc.on('console-message', (_e, level, message, line, sourceId) => {
-    log(`[console:${level}] ${message} (${String(sourceId).split(/[#?]/)[0]}:${line})`)
+    if (level >= 2 || debug) log(`[console:${level}] ${message} (${String(sourceId).split(/[#?]/)[0]}:${line})`)
   })
 
   // 4. Offline page: when the server page itself fails to load, show the shell's own page with
@@ -134,8 +135,8 @@ function createWindow() {
     if (/^https?:/.test(url)) shell.openExternal(url)
     return { action: 'deny' }
   })
-  // Periodic screenshots so the run can be verified over SSH without screen access.
-  for (const delay of [8000, 25000, 60000]) {
+  // Debug only: periodic screenshots so a run can be verified over SSH without screen access.
+  for (const delay of debug ? [8000, 25000, 60000] : []) {
     setTimeout(async () => {
       if (win.isDestroyed()) return
       try {
@@ -150,8 +151,9 @@ function createWindow() {
 
 
 
-  // Fixed capability probe, logged once per load. No external input is executed.
+  // Debug only: fixed capability probe, logged once per load. No external input is executed.
   wc.on('did-finish-load', async () => {
+    if (!debug) return
     try {
       const r = await wc.executeJavaScript(`(() => ({
         polyfilled: window.__orcaHsPolyfills === true,
@@ -176,7 +178,7 @@ function createWindow() {
     }
   })
 
-  log(`[start] electron=${process.versions.electron} chrome=${process.versions.chrome} target=${targetUrl ? 'url' : 'prompt'}`)
+  log(`[start] electron=${process.versions.electron} chrome=${process.versions.chrome} target=${targetUrl ? 'url' : 'prompt'} debug=${debug}`)
   // After the server page loads, remember only its origin for the next launch. The pairing
   // code itself stays in the page's localStorage (upstream web client behaviour), not on disk.
   wc.on('did-finish-load', () => {

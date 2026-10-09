@@ -5,8 +5,8 @@ const { createClipboardPolicy, MAX_WRITES_PER_WINDOW, WINDOW_MS } = require('../
 const good = {
   senderIsWindow: true,
   frameIsMain: true,
-  frameUrl: 'http://192.168.1.11:6768/',
-  allowedOrigin: 'http://192.168.1.11:6768',
+  frameUrl: 'http://192.0.2.10:6768/',
+  allowedOrigin: 'http://192.0.2.10:6768',
   text: 'hello'
 }
 
@@ -18,7 +18,7 @@ test('denies other senders, subframes, wrong origins and bad payloads', () => {
   const p = createClipboardPolicy()
   assert.match(p({ ...good, senderIsWindow: false }).reason, /sender/)
   assert.match(p({ ...good, frameIsMain: false }).reason, /main frame/)
-  assert.match(p({ ...good, frameUrl: 'http://192.168.1.11:6769/' }).reason, /not the server origin/)
+  assert.match(p({ ...good, frameUrl: 'http://192.0.2.10:6769/' }).reason, /not the server origin/)
   assert.match(p({ ...good, frameUrl: 'http://evil.example/' }).reason, /not the server origin/)
   assert.match(p({ ...good, frameUrl: 'not a url' }).reason, /invalid/)
   assert.match(p({ ...good, allowedOrigin: null }).reason, /no server origin/)

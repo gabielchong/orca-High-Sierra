@@ -2,9 +2,9 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { resolvePairInput, persistableUrl } = require('../app/pair-link')
 
-const payload = { v: 2, endpoint: 'ws://192.168.1.11:6768', deviceToken: 'abc', publicKeyB64: 'k=', pairedDeviceId: 'id', scope: 'runtime' }
+const payload = { v: 2, endpoint: 'ws://192.0.2.10:6768', deviceToken: 'abc', publicKeyB64: 'k=', pairedDeviceId: 'id', scope: 'runtime' }
 const code = Buffer.from(JSON.stringify(payload)).toString('base64url')
-const expected = `http://192.168.1.11:6768/#code=${code}`
+const expected = `http://192.0.2.10:6768/#code=${code}`
 
 test('orca://pair link', () => {
   const r = resolvePairInput(`orca://pair?code=${code}`)
@@ -14,11 +14,11 @@ test('orca://pair link', () => {
 })
 
 test('browser pairing URL with hash', () => {
-  assert.equal(resolvePairInput(`http://192.168.1.11:6768/#code=${code}`).url, expected)
+  assert.equal(resolvePairInput(`http://192.0.2.10:6768/#code=${code}`).url, expected)
 })
 
 test('browser pairing URL with orca:// inside the hash', () => {
-  assert.equal(resolvePairInput(`http://192.168.1.11:6768/#orca://pair?code=${code}`).url, expected)
+  assert.equal(resolvePairInput(`http://192.0.2.10:6768/#orca://pair?code=${code}`).url, expected)
 })
 
 test('bare code', () => {
@@ -26,8 +26,8 @@ test('bare code', () => {
 })
 
 test('plain server URL keeps origin only', () => {
-  const r = resolvePairInput('http://192.168.1.11:6768/?x=1')
-  assert.equal(r.url, 'http://192.168.1.11:6768/')
+  const r = resolvePairInput('http://192.0.2.10:6768/?x=1')
+  assert.equal(r.url, 'http://192.0.2.10:6768/')
   assert.equal(r.paired, false)
 })
 
@@ -45,5 +45,5 @@ test('rejects junk', () => {
 })
 
 test('persistableUrl strips the hash', () => {
-  assert.equal(persistableUrl(expected), 'http://192.168.1.11:6768/')
+  assert.equal(persistableUrl(expected), 'http://192.0.2.10:6768/')
 })

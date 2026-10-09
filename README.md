@@ -49,6 +49,12 @@ open -na ~/Desktop/OrcaHS/OrcaHS.app --args --base-dir=$HOME/Desktop/OrcaHS/data
 四種輸入是同一份 payload，`app/pair-link.js` 負責轉換。`--url=` 參數與 `data/server-url.txt` 也接受同樣輸入。
 server 頁載入後只把 origin 寫回 `server-url.txt`（mode 600）；pairing code 留在頁面的 localStorage，與上游 web client 行為相同。
 
+## 除錯
+
+加 `--hs-debug` 會在 `data/logs/` 多寫：啟動後 8/25/60 秒的視窗截圖、頁面能力探針（WebGL、polyfill、secure context）、
+所有 console 訊息。不加時只記錄 warning 以上的 console 訊息與載入事件。
+旗標名刻意不用 `--debug`，那個會被 Electron 當成 Node 旗標攔走。
+
 ## 連不上 server 時
 
 主頁載入失敗（連線被拒、逾時、renderer 當掉）會切到殼自己的 `offline.html`：顯示錯誤碼、每 10 秒自動探測一次
@@ -65,6 +71,14 @@ node --test test/*.test.js
 
 - `master` — 穩定版。
 - `develop` — 整合分支，feature / fix 分支以 `--no-ff` merge 進來。
+
+## 公開 repo 前
+
+- 不要 commit：`dist/`、`data/`、log、截圖、任何 pairing code 或 `server-url.txt`（`.gitignore` 已擋）。
+- 文件與測試只用保留位址（`192.0.2.x`）與 `<server>` 佔位，不寫實際網段、機器名、路徑。
+- 簽章是 ad-hoc（`codesign --sign -`），repo 內沒有 Apple ID、Team ID、憑證或 provisioning profile。
+  將來若改用 Developer ID，身份只能從環境變數（如 `CSC_NAME`）帶入，不得寫進 repo。
+- 推上去前跑一次 `gitleaks detect` 或同類工具掃整個歷史。
 
 ## 已知限制
 
