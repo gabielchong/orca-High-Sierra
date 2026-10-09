@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>OrcaHS</title>
+<style>
+  body { font: 14px -apple-system, sans-serif; padding: 24px; background: #111; color: #eee; max-width: 760px; }
+  h2 { margin-top: 0 }
+  input { width: 100%; padding: 8px; font-size: 13px; box-sizing: border-box; }
+  button { padding: 6px 14px; font-size: 13px; }
+  #err { color: #f66; min-height: 1.2em; }
+  code { background: #222; padding: 1px 4px; }
+  .dim { opacity: .6 }
+  ul.servers { list-style: none; padding: 0; margin: 0 0 24px; }
+  ul.servers li { display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: #1a1a1a; border-radius: 6px; margin-bottom: 6px; }
+  ul.servers .label { flex: 1; }
+  ul.servers .origin { opacity: .6; font-size: 12px; }
+  ul.servers button.rm { background: transparent; color: #f66; border: 1px solid #533; }
+  h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; opacity: .6; margin: 24px 0 8px; }
+</style>
+</head>
+<body>
+<h2>OrcaHS</h2>
+
+<h3>Paired servers</h3>
+<ul class="servers" id="servers"><li class="dim">Loading…</li></ul>
+
+<h3>Add a server</h3>
+<p class="dim">Paste <code>orca://pair?code=…</code> (Settings → Remote Orca Servers → Pair another Orca client), the browser URL printed by <code>orca serve</code>, or a server URL you already paired with.</p>
+<input id="u" placeholder="orca://pair?code=…" autofocus>
+<p><button id="go">Connect</button> <span id="err"></span></p>
+<p class="dim" id="ver"></p>
+<script src="pair-link.js"></script>
+<script>
+  const input = document.getElementById('u')
+  const err = document.getElementById('err')
+  const list = document.getElementById('servers')
+
+  function connect(raw) {
+    const r = OrcaHsPairLink.resolvePairInput(raw)
+    if (r.error) { err.textContent = r.error; return }
+    if (r.scope && r.scope !== 'runtime') { err.textContent = `pairing scope is "${r.scope}", expected "runtime"`; return }
+    err.textContent = ''
+    location.href = r.url
+  }
+
+  async function render() {
+    const servers = window.orcaHs ? await window.orcaHs.listServers() : []
+    list.innerHTML = ''
+    if (!servers.length) {
+      const li = document.createElement('li'); li.className = 'dim'; li.textContent = 'None yet. Add one below.'; list.appendChild(li); return
+    }
+    for (const s of servers) {
+      const li = document.createElement('li')
+      const label = document.createElement('div'); label.className = 'label'
+      label.innerHTML = `<div></div><div class="origin"></div>`
+      label.children[0].textContent = s.label
+      label.children[1].textContent = s.origin + (s.lastUsedAt ? ` · last used ${new Date(s.lastUsedAt).toLocaleString()}` : '')
+      const go = document.createElement('button'); go.textContent = 'Connect'; go.onclick = () => connect(s.origin)
+      const rm = document.createElement('button'); rm.className = 'rm'; rm.textContent = 'Remove'
+      rm.onclick = async () => {
+        if (!confirm(`Remove ${s.label}?\nThis forgets the pairing on this machine. Revoke it on the server from Settings → Remote Orca Servers.`)) return
+        await window.orcaHs.removeServer(s.origin)
+        render()
+      }
+      li.append(label, go, rm)
+      list.appendChild(li)
+    }
+  }
+
+  document.getElementById('go').onclick = () => connect(input.value)
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(input.value) })
+  document.getElementById('ver').textContent = navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0] + ' · ' + navigator.platform
+  render()
+</script>
+</body>
+</html>
