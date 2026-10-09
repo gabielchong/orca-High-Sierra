@@ -30,22 +30,20 @@
 <input id="u" placeholder="orca://pair?code=…" autofocus>
 <p><button id="go">Connect</button> <span id="err"></span></p>
 <p class="dim" id="ver"></p>
-<script src="pair-link.js"></script>
 <script>
   const input = document.getElementById('u')
   const err = document.getElementById('err')
   const list = document.getElementById('servers')
+  const api = window.orcaHs
 
-  function connect(raw) {
-    const r = OrcaHsPairLink.resolvePairInput(raw)
-    if (r.error) { err.textContent = r.error; return }
-    if (r.scope && r.scope !== 'runtime') { err.textContent = `pairing scope is "${r.scope}", expected "runtime"`; return }
-    err.textContent = ''
-    location.href = r.url
+  async function connect(raw) {
+    if (!api) { err.textContent = 'shell bridge unavailable'; return }
+    const r = await api.connect(raw)
+    err.textContent = r && r.ok ? '' : (r && r.reason) || 'could not connect'
   }
 
   async function render() {
-    const servers = window.orcaHs ? await window.orcaHs.listServers() : []
+    const servers = api ? await api.listServers() : []
     list.innerHTML = ''
     if (!servers.length) {
       const li = document.createElement('li'); li.className = 'dim'; li.textContent = 'None yet. Add one below.'; list.appendChild(li); return
@@ -55,12 +53,13 @@
       const label = document.createElement('div'); label.className = 'label'
       label.innerHTML = `<div></div><div class="origin"></div>`
       label.children[0].textContent = s.label
-      label.children[1].textContent = s.origin + (s.lastUsedAt ? ` · last used ${new Date(s.lastUsedAt).toLocaleString()}` : '')
-      const go = document.createElement('button'); go.textContent = 'Connect'; go.onclick = () => connect(s.origin)
+      label.children[1].textContent = s.url + (s.lastUsedAt ? ` · last used ${new Date(s.lastUsedAt).toLocaleString()}` : '')
+      const go = document.createElement('button'); go.textContent = 'Connect'; go.onclick = () => connect(s.url)
       const rm = document.createElement('button'); rm.className = 'rm'; rm.textContent = 'Remove'
       rm.onclick = async () => {
-        if (!confirm(`Remove ${s.label}?\nThis forgets the pairing on this machine. Revoke it on the server from Settings → Remote Orca Servers.`)) return
-        await window.orcaHs.removeServer(s.origin)
+        if (!confirm(`Remove ${s.label}?\nThis forgets the pairing on this Mac. Revoke it on the server too, under Settings → Remote Orca Servers.`)) return
+        const r = await api.removeServer(s.origin)
+        err.textContent = r && r.ok ? '' : (r && r.reason) || 'remove failed'
         render()
       }
       li.append(label, go, rm)

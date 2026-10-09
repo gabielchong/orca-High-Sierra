@@ -7,23 +7,34 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ELECTRON_VERSION="${ELECTRON_VERSION:-26.6.10}"
 ARCH="${ARCH:-x64}"
 OUT="${OUT:-$HERE/dist}"
+mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
 DL="$OUT/download"
 mkdir -p "$DL"
 
-read_pkg() { node -p "require('$HERE/app/package.json').$1"; }
+read_pkg() { node -e 'console.log(require(process.argv[1])[process.argv[2]])' "$HERE/app/package.json" "$1"; }
+
+# The High Sierra build is only known to work with Electron 26.x on x64. Anything else needs an
+# explicit opt-in and gets a distinct artifact name so it cannot be mistaken for the 10.13 build.
+MAJOR="${ELECTRON_VERSION%%.*}"
+if [ "$MAJOR" != "26" ] || [ "$ARCH" != "x64" ]; then
+  [ "${ORCAHS_ALLOW_UNSUPPORTED:-}" = "1" ] || { echo "Electron $ELECTRON_VERSION/$ARCH is not the supported 10.13 configuration (26.x/x64). Set ORCAHS_ALLOW_UNSUPPORTED=1 to build anyway." >&2; exit 1; }
+  SUFFIX="-electron$ELECTRON_VERSION-$ARCH"
+else
+  SUFFIX=""
+fi
 PRODUCT="$(read_pkg productName)"
 VERSION="$(read_pkg version)"
 BUNDLE_ID="$(read_pkg bundleId)"
 
 # 1. Official Electron release, checksum-verified.
 ZIP="$DL/electron-v$ELECTRON_VERSION-darwin-$ARCH.zip"
-if [ ! -f "$ZIP" ]; then
-  curl -fsSL -o "$ZIP" "https://github.com/electron/electron/releases/download/v$ELECTRON_VERSION/electron-v$ELECTRON_VERSION-darwin-$ARCH.zip"
-  curl -fsSL -o "$DL/SHASUMS256.txt" "https://github.com/electron/electron/releases/download/v$ELECTRON_VERSION/SHASUMS256.txt"
-fi
-expected="$(grep " \*electron-v$ELECTRON_VERSION-darwin-$ARCH.zip" "$DL/SHASUMS256.txt" | cut -d' ' -f1)"
+SUMS="$DL/SHASUMS256-v$ELECTRON_VERSION.txt"
+BASE="https://github.com/electron/electron/releases/download/v$ELECTRON_VERSION"
+[ -f "$SUMS" ] || { curl -fsSL -o "$SUMS.part" "$BASE/SHASUMS256.txt" && mv "$SUMS.part" "$SUMS"; }
+[ -f "$ZIP" ]  || { curl -fsSL -o "$ZIP.part" "$BASE/electron-v$ELECTRON_VERSION-darwin-$ARCH.zip" && mv "$ZIP.part" "$ZIP"; }
+expected="$(grep " \*electron-v$ELECTRON_VERSION-darwin-$ARCH.zip" "$SUMS" | cut -d' ' -f1)"
 actual="$(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
-[ "$expected" = "$actual" ] || { echo "checksum mismatch for $ZIP" >&2; exit 1; }
+[ -n "$expected" ] && [ "$expected" = "$actual" ] || { echo "checksum mismatch for $ZIP" >&2; rm -f "$ZIP"; exit 1; }
 
 # 2. Stage the bundle.
 STAGE="$OUT/stage"
@@ -35,6 +46,12 @@ RES="$APP_DIR/Contents/Resources"
 mkdir -p "$RES/app"
 cp "$HERE"/app/*.js "$HERE"/app/*.html "$HERE/app/package.json" "$RES/app/"
 rm -f "$RES/default_app.asar"
+# License notices travel with the app: this project's, Electron's, and Chromium's third-party list.
+mkdir -p "$RES/licenses"
+cp "$HERE/LICENSE" "$RES/licenses/LICENSE-$PRODUCT.txt"
+cp "$STAGE/LICENSE" "$RES/licenses/LICENSE-Electron.txt"
+cp "$STAGE/LICENSES.chromium.html" "$RES/licenses/LICENSES.chromium.html"
+rm -f "$STAGE/LICENSE" "$STAGE/LICENSES.chromium.html" "$STAGE/version"
 
 # 3. Identity: name, bundle id, version, executable name, minimum OS.
 PL="$APP_DIR/Contents/Info.plist"
@@ -68,8 +85,8 @@ codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 
 # 6. Artifacts: zip (for scp) and dmg (for download / Finder install).
-ZIP_OUT="$OUT/$PRODUCT-$VERSION.zip"
-DMG_OUT="$OUT/$PRODUCT-$VERSION.dmg"
+ZIP_OUT="$OUT/$PRODUCT-$VERSION$SUFFIX.zip"
+DMG_OUT="$OUT/$PRODUCT-$VERSION$SUFFIX.dmg"
 rm -f "$ZIP_OUT" "$DMG_OUT"
 (cd "$STAGE" && ditto -c -k --keepParent "$PRODUCT.app" "$ZIP_OUT")
 DMG_ROOT="$OUT/dmg-root"; rm -rf "$DMG_ROOT"; mkdir -p "$DMG_ROOT"
@@ -77,6 +94,10 @@ cp -R "$APP_DIR" "$DMG_ROOT/"
 ln -s /Applications "$DMG_ROOT/Applications"
 hdiutil create -quiet -volname "$PRODUCT $VERSION" -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG_OUT"
 rm -rf "$DMG_ROOT" "$ICONSET"
+# Sanity: the zip must carry the license notices and a 10.13-capable x64 binary.
+# (grep without -q: with pipefail, an early-exiting grep would make unzip fail on SIGPIPE)
+if ! unzip -l "$ZIP_OUT" | grep "licenses/LICENSES.chromium.html" >/dev/null; then echo "license notices missing from $ZIP_OUT" >&2; exit 1; fi
+file "$APP_DIR/Contents/MacOS/$PRODUCT" | grep -q x86_64 || echo "warning: main binary is not x86_64" >&2
 
 echo "built:"
 for f in "$ZIP_OUT" "$DMG_OUT"; do echo "  $f  $(shasum -a 256 "$f" | cut -c1-16)  $(du -h "$f" | cut -f1)"; done
