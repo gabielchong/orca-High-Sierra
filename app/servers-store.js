@@ -14,24 +14,41 @@ function labelFor(origin) {
   try { return new URL(origin).host } catch { return String(origin) }
 }
 
+// Launch url: origin + path, never query or hash (which may carry the pairing code).
+function launchUrlOf(input) {
+  try {
+    const u = new URL(String(input))
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+    return `${u.origin}${u.pathname}`
+  } catch {
+    return null
+  }
+}
+
 function parse(json) {
   try {
     const data = JSON.parse(json)
     const list = Array.isArray(data) ? data : Array.isArray(data && data.servers) ? data.servers : []
     return list
       .filter((s) => s && normalizeOrigin(s.origin))
-      .map((s) => ({ origin: normalizeOrigin(s.origin), label: typeof s.label === 'string' && s.label.trim() ? s.label.trim() : labelFor(s.origin), lastUsedAt: Number(s.lastUsedAt) || 0 }))
+      .map((s) => {
+        const origin = normalizeOrigin(s.origin)
+        const url = launchUrlOf(s.url) && launchUrlOf(s.url).startsWith(origin) ? launchUrlOf(s.url) : `${origin}/`
+        return { origin, url, label: typeof s.label === 'string' && s.label.trim() ? s.label.trim() : labelFor(origin), lastUsedAt: Number(s.lastUsedAt) || 0 }
+      })
   } catch {
     return []
   }
 }
 
-function upsert(list, origin, now = Date.now()) {
-  const o = normalizeOrigin(origin)
-  if (!o) return list
+// `input` is any URL on the server (hash and query are dropped); one entry per origin.
+function upsert(list, input, now = Date.now()) {
+  const o = normalizeOrigin(input)
+  const url = launchUrlOf(input)
+  if (!o || !url) return list
   const rest = list.filter((s) => s.origin !== o)
   const existing = list.find((s) => s.origin === o)
-  return sort([{ origin: o, label: existing ? existing.label : labelFor(o), lastUsedAt: now }, ...rest])
+  return sort([{ origin: o, url, label: existing ? existing.label : labelFor(o), lastUsedAt: now }, ...rest])
 }
 
 function remove(list, origin) {
@@ -47,4 +64,4 @@ function serialize(list) {
   return JSON.stringify({ servers: sort(list) }, null, 2)
 }
 
-module.exports = { normalizeOrigin, labelFor, parse, upsert, remove, sort, serialize }
+module.exports = { normalizeOrigin, launchUrlOf, labelFor, parse, upsert, remove, sort, serialize }

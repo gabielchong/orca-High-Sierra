@@ -13,8 +13,10 @@ test('orca://pair link', () => {
   assert.equal(r.paired, true)
 })
 
-test('browser pairing URL with hash', () => {
-  assert.equal(resolvePairInput(`http://192.0.2.10:6768/#code=${code}`).url, expected)
+test('browser pairing URL with hash keeps the scope', () => {
+  const r = resolvePairInput(`http://192.0.2.10:6768/#code=${code}`)
+  assert.equal(r.url, expected)
+  assert.equal(r.scope, 'runtime')
 })
 
 test('browser pairing URL with orca:// inside the hash', () => {
