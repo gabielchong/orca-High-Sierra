@@ -9,6 +9,10 @@ const { createClipboardPolicy } = require('./clipboard-policy')
 const servers = require('./servers-store')
 const { scrub, safeUrl, truncate } = require('./log-scrub')
 const { createNavPolicy } = require('./nav-policy')
+const { resolveBaseDir } = require('./base-dir')
+const updates = require('./update-check')
+const updater = require('./updater')
+const https = require('https')
 
 const argv = process.argv.slice(1)
 const debug = argv.includes('--hs-debug')
@@ -24,7 +28,14 @@ function argValue(name) {
 // ---------------------------------------------------------------------------------------------
 // Storage: everything the app writes lives under baseDir, private to the user.
 // ---------------------------------------------------------------------------------------------
-const baseDir = argValue('base-dir') || path.join(app.getPath('appData'), pkg.productName)
+const baseDirInfo = resolveBaseDir({
+  argBaseDir: argValue('base-dir'),
+  execPath: process.execPath,
+  appData: app.getPath('appData'),
+  productName: pkg.productName,
+  exists: (p) => { try { return fs.statSync(p).isDirectory() } catch { return false } }
+})
+const baseDir = baseDirInfo.dir
 const userData = path.join(baseDir, 'userdata')
 const logsDir = path.join(baseDir, 'logs')
 for (const dir of [baseDir, userData, logsDir]) {
@@ -111,11 +122,68 @@ if (!fs.existsSync(serversFile) && fs.existsSync(legacyUrlFile)) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Update reminder: once a day, GET the latest GitHub release and compare versions. Never
+// downloads or installs. Disabled with --no-update-check or "disabled": true in update-check.json.
+// ---------------------------------------------------------------------------------------------
+const updateStateFile = path.join(baseDir, 'update-check.json')
+function loadUpdateState() {
+  try { return JSON.parse(fs.readFileSync(updateStateFile, 'utf8')) } catch { return {} }
+}
+function saveUpdateState(state) {
+  try { fs.writeFileSync(updateStateFile, JSON.stringify(state, null, 2), { mode: 0o600 }) } catch (err) { log(`[update] save failed: ${err && err.message}`) }
+}
+let updateState = loadUpdateState()
+if (argv.includes('--no-update-check')) updateState.disabled = true
+let latestRelease = null // { version, url, name } when a newer release is known
+
+function fetchLatestRelease() {
+  return new Promise((resolve) => {
+    const req = https.get(updates.RELEASES_API, {
+      headers: { 'User-Agent': `${pkg.productName}/${pkg.version}`, Accept: 'application/vnd.github+json' },
+      timeout: 8000
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve({ error: `HTTP ${res.statusCode}` }) }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (c) => { body += c; if (body.length > 256 * 1024) { req.destroy(); resolve({ error: 'response too large' }) } })
+      res.on('end', () => resolve({ release: updates.parseLatestRelease(body) }))
+    })
+    req.on('timeout', () => { req.destroy(); resolve({ error: 'timeout' }) })
+    req.on('error', (err) => resolve({ error: err && err.message }))
+  })
+}
+
+async function checkForUpdate({ force = false, onResult } = {}) {
+  if (!force && !updates.shouldCheck(updateState)) return
+  if (updateState.disabled && !force) return
+  const r = await fetchLatestRelease()
+  updateState.lastCheckedAt = Date.now()
+  if (r.error || !r.release) {
+    log(`[update] check failed: ${r.error || 'unparseable response'}`)
+    saveUpdateState(updateState)
+    if (onResult) onResult({ error: r.error || 'could not read the release information' })
+    return
+  }
+  updateState.latestVersion = r.release.version
+  updateState.latestUrl = r.release.url
+  saveUpdateState(updateState)
+  const newer = updates.isNewer(r.release.version, pkg.version)
+  latestRelease = newer ? r.release : null
+  log(`[update] latest=${r.release.version} current=${pkg.version} newer=${newer}`)
+  if (onResult) onResult({ release: r.release, newer })
+}
+
+function openReleasePage(url) {
+  if (typeof url === 'string' && url.startsWith(updates.RELEASES_PAGE_PREFIX)) shell.openExternal(url)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------------------------
 const promptUrl = pathToFileURL(path.join(__dirname, 'prompt.html')).href
 const offlineUrl = pathToFileURL(path.join(__dirname, 'offline.html')).href
-const navPolicy = createNavPolicy({ shellPages: [promptUrl, offlineUrl] })
+const toastUrl = pathToFileURL(path.join(__dirname, 'toast.html')).href
+const navPolicy = createNavPolicy({ shellPages: [promptUrl, offlineUrl, toastUrl] })
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -283,7 +351,10 @@ function createWindow() {
   ipcMain.handle('orca-hs:connect', (event, input) => (fromShellPage(event) ? connectTo(String(input), 'picker') : { ok: false, reason: 'not allowed' }))
   ipcMain.handle('orca-hs:retry', (event) => (fromShellPage(event) ? retry() : { ok: false, reason: 'not allowed' }))
   ipcMain.handle('orca-hs:switch', (event) => { if (fromShellPage(event)) showPrompt(); return { ok: true } })
-  ipcMain.handle('orca-hs:state', (event) => (fromShellPage(event) ? { origin: trustedOrigin, pending: !!pendingTarget } : {}))
+  ipcMain.handle('orca-hs:state', (event) => (fromShellPage(event)
+    ? { origin: trustedOrigin, pending: !!pendingTarget, version: pkg.version }
+    : {}))
+  ipcMain.handle('orca-hs:open-release', (event) => { if (fromShellPage(event) && latestRelease) openReleasePage(latestRelease.url); return { ok: true } })
 
   // --- Clipboard: the one bridge for remote content. Write-only, policed in clipboard-policy.js.
   const clipboardPolicy = createClipboardPolicy()
@@ -334,18 +405,120 @@ function createWindow() {
 
   // --- Startup target: --prompt → picker; --url → that; else the most recently used server.
   const startInput = argv.includes('--prompt') ? '' : (argValue('url') || (serverList[0] ? serverList[0].url : ''))
-  log(`[start] ${pkg.productName} ${pkg.version} electron=${process.versions.electron} chrome=${process.versions.chrome} debug=${debug}`)
+  log(`[start] ${pkg.productName} ${pkg.version} electron=${process.versions.electron} chrome=${process.versions.chrome} data=${baseDirInfo.mode} debug=${debug}`)
   if (!startInput || !connectTo(startInput, 'startup').ok) showPrompt()
+
+  // --- Update toast: a small frameless window pinned to the bottom-right of the main window,
+  // like the official client's. "Download and Install" runs app/updater.js; "Later" hides it
+  // until the next launch. It is a separate window, so it sits over the remote page too.
+  let toast = null
+  let progress = { stage: 'idle' }
+  function toastSend(channel, payload) { if (toast && !toast.isDestroyed()) toast.webContents.send(channel, payload) }
+  function positionToast() {
+    if (!toast || toast.isDestroyed() || win.isDestroyed()) return
+    const [w, h] = win.getSize(); const [x, y] = win.getPosition()
+    const [tw, th] = toast.getSize()
+    toast.setPosition(x + w - tw - 16, y + h - th - 16)
+  }
+  function showToast() {
+    if (!latestRelease || win.isDestroyed()) return
+    if (toast && !toast.isDestroyed()) { toastSend('orca-hs:update-progress', updateStateForPage()); return }
+    toast = new BrowserWindow({
+      parent: win, width: 380, height: 132, frame: false, transparent: true, resizable: false, movable: false,
+      minimizable: false, maximizable: false, fullscreenable: false, hasShadow: false, show: false, focusable: true,
+      webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, preload: path.join(__dirname, 'preload.js') }
+    })
+    toast.setMenu(null)
+    toast.webContents.on('will-navigate', (e) => e.preventDefault())
+    toast.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    toast.once('ready-to-show', () => { positionToast(); toast.show() })
+    toast.on('closed', () => { toast = null })
+    toast.loadFile(path.join(__dirname, 'toast.html'))
+    win.on('move', positionToast); win.on('resize', positionToast)
+  }
+  function hideToast() { if (toast && !toast.isDestroyed()) toast.close(); toast = null }
+  function updateStateForPage() { return { update: latestRelease, current: pkg.version, progress } }
+  function setProgress(p) { progress = p; toastSend('orca-hs:update-progress', updateStateForPage()) }
+
+  let installing = false
+  let lastLoggedBytes = 0
+  async function startInstall() {
+    lastLoggedBytes = 0
+    if (installing || !latestRelease) return { ok: false, reason: installing ? 'already running' : 'no update' }
+    installing = true
+    log(`[update] installing ${latestRelease.version}`)
+    try {
+      await updater.installUpdate({
+        release: latestRelease,
+        baseDir,
+        execPath: process.execPath,
+        userAgent: `${pkg.productName}/${pkg.version}`,
+        productName: pkg.productName,
+        onStage: (st) => {
+          if (st.stage !== 'download') { setProgress(st); log(`[update] ${st.stage}`); return }
+          // Progress events arrive per chunk: update the toast every 256 KiB, log every 8 MiB.
+          if (!progress.received || st.received - progress.received > 256 * 1024 || st.received === st.total) setProgress(st)
+          if (!lastLoggedBytes || st.received - lastLoggedBytes > 8 * 1024 * 1024 || st.received === st.total) { lastLoggedBytes = st.received; log(`[update] download ${st.received}/${st.total}`) }
+        },
+        relaunch: (newExec, backup) => {
+          updateState.cleanup = backup
+          saveUpdateState(updateState)
+          log(`[update] relaunching ${safeUrl(newExec)}`)
+          // Pass our own arguments explicitly (Electron does not when execPath is given) and drop
+          // the test-only --hs-update-now so the new version does not immediately update again.
+          app.relaunch({ execPath: newExec, args: argv.filter((a) => a !== '--hs-update-now') })
+          app.exit(0)
+        }
+      })
+      return { ok: true }
+    } catch (err) {
+      installing = false
+      const message = (err && err.message) || String(err)
+      log(`[update] failed: ${message}`)
+      setProgress({ stage: 'error', message })
+      return { ok: false, reason: message }
+    }
+  }
+
+  // Toast / picker IPC (shell pages only; fromShellPage covers toast.html too)
+  ipcMain.handle('orca-hs:update-state', (event) => (fromShellPage(event) ? updateStateForPage() : {}))
+  ipcMain.handle('orca-hs:update-install', (event) => (fromShellPage(event) ? startInstall() : { ok: false, reason: 'not allowed' }))
+  ipcMain.handle('orca-hs:update-dismiss', (event) => { if (fromShellPage(event)) { hideToast(); log('[update] dismissed') } return { ok: true } })
+
+  // Daily check a few seconds after launch (never delays the first page); hourly re-check of the
+  // 24 h interval. A newer release shows the toast. --hs-update-now (testing) installs immediately.
+  function onCheckResult({ newer }) {
+    if (!newer || win.isDestroyed()) return
+    showToast()
+    if (argv.includes('--hs-update-now')) startInstall()
+  }
+  setTimeout(() => checkForUpdate({ onResult: onCheckResult }), 5000)
+  setInterval(() => checkForUpdate({ onResult: onCheckResult }), 60 * 60 * 1000)
+  win.__orcaHs = { checkNow: () => checkForUpdate({ force: true, onResult: (r) => { onCheckResult(r); return r } }), showToast, hasUpdate: () => !!latestRelease }
 
   return { win, showPrompt }
 }
 
-function buildMenu(showPrompt) {
+function buildMenu({ showPrompt, win }) {
   const template = [
     {
       label: app.name,
       submenu: [
         { role: 'about' },
+        {
+          label: 'Check for Updates…',
+          click: () => checkForUpdate({
+            force: true,
+            onResult: ({ release, newer, error }) => {
+              if (win.isDestroyed()) return
+              if (newer) { win.__orcaHs.showToast(); return }
+              dialog.showMessageBox(win, error
+                ? { type: 'warning', message: 'Could not check for updates', detail: String(error), buttons: ['OK'] }
+                : { type: 'info', message: 'You are up to date', detail: `${pkg.productName} ${pkg.version} is the latest release.`, buttons: ['OK'] }
+              ).catch(() => {})
+            }
+          })
+        },
         { type: 'separator' },
         { label: 'Switch Server…', accelerator: 'CmdOrCtrl+Shift+S', click: showPrompt },
         { type: 'separator' },
@@ -363,8 +536,10 @@ function buildMenu(showPrompt) {
 
 app.whenReady().then(() => {
   cleanupSystemTraces()
-  const { showPrompt } = createWindow()
-  buildMenu(showPrompt)
+  updater.cleanupOldBundles(process.execPath, log)
+  if (updateState.cleanup) { delete updateState.cleanup; saveUpdateState(updateState) }
+  const { win, showPrompt } = createWindow()
+  buildMenu({ showPrompt, win })
 })
 app.on('will-quit', () => { cleanupSystemTraces(); log('[quit] cleanup done') })
 app.on('window-all-closed', () => app.quit())

@@ -69,7 +69,12 @@
 
   document.getElementById('go').onclick = () => connect(input.value)
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(input.value) })
-  document.getElementById('ver').textContent = navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0] + ' · ' + navigator.platform
+  async function showVersion() {
+    const st = api ? await api.state() : {}
+    const chrome = navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0]
+    document.getElementById('ver').textContent = `OrcaHS ${st.version || ''} · ${chrome} · ${navigator.platform}`
+  }
+  showVersion()
   render()
 </script>
 </body>
