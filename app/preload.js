@@ -3,9 +3,11 @@
 // 2. On insecure (plain http) origins, where Chromium removes navigator.clipboard entirely, installs a
 //    write-only shim: writeText goes through postMessage to this preload, then IPC to the main process,
 //    which enforces the policy in clipboard-policy.js. Reads are rejected; use Cmd+V.
+// 3. On the shell's own file:// pages only, exposes the small picker API (the main process re-checks
+//    the exact page URL on every call).
 const { webFrame, ipcRenderer, contextBridge } = require('electron')
 
-const CHANNEL = 'orca-hs:clipboard-write-text'
+const WRITE_CHANNEL = 'orca-hs:clipboard-write-text'
 const REQUEST = 'orca-hs:clipboard:request'
 const REPLY = 'orca-hs:clipboard:reply'
 
@@ -28,7 +30,7 @@ const polyfills = `(() => {
   }
   if (typeof Object.groupBy !== 'function') {
     Object.groupBy = (items, keyFn) => groupBy(items, keyFn, () => Object.create(null),
-      (out, key, item) => { (out[key] ||= []).push(item) })
+      (out, key, item) => { const k = typeof key === 'symbol' ? key : String(key); (out[k] ||= []).push(item) })
   }
   if (typeof Map.groupBy !== 'function') {
     Map.groupBy = (items, keyFn) => groupBy(items, keyFn, () => new Map(),
@@ -38,7 +40,10 @@ const polyfills = `(() => {
     Array.fromAsync = async function (items, mapFn, thisArg) {
       const out = []
       let i = 0
-      for await (const item of items) out.push(mapFn ? await mapFn.call(thisArg, item, i++) : item)
+      const iterable = (items != null && (Symbol.asyncIterator in Object(items) || Symbol.iterator in Object(items)))
+        ? items
+        : Array.from(items) // array-like
+      for await (const item of iterable) out.push(mapFn ? await mapFn.call(thisArg, item, i++) : item)
       return out
     }
   }
@@ -47,13 +52,15 @@ const polyfills = `(() => {
   }
   if (typeof globalThis.Iterator === 'undefined') {
     // Minimal shim: expose the real %IteratorPrototype% so feature checks like
-    // typeof Iterator.prototype.join do not throw ReferenceError.
+    // typeof Iterator.prototype.join do not throw ReferenceError. Helper methods are not provided.
     const proto = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()))
     globalThis.Iterator = function Iterator() {}
     globalThis.Iterator.prototype = proto
   }
 
   // Write-only clipboard shim for insecure contexts. Only installed when the real API is absent.
+  // read/readText/write are deliberately left undefined so the upstream renderer's feature checks
+  // (navigator.clipboard?.read) skip image paste quietly instead of surfacing an error dialog.
   if (!window.isSecureContext && !('clipboard' in navigator)) {
     const pending = new Map()
     let seq = 0
@@ -65,7 +72,6 @@ const polyfills = `(() => {
       if (e.data.ok) p.resolve()
       else p.reject(new DOMException(e.data.reason || 'clipboard write rejected', 'NotAllowedError'))
     })
-    const denied = (what) => Promise.reject(new DOMException(what + ' is not available on an insecure origin; use Cmd+V', 'NotAllowedError'))
     const clipboard = Object.freeze({
       writeText(text) {
         return new Promise((resolve, reject) => {
@@ -74,11 +80,7 @@ const polyfills = `(() => {
           window.postMessage({ type: ${JSON.stringify(REQUEST)}, id, text: String(text) }, window.location.origin)
           setTimeout(() => { if (pending.delete(id)) reject(new DOMException('clipboard write timed out', 'NotAllowedError')) }, 5000)
         })
-      },
-      readText: () => denied('clipboard.readText'),
-      read: () => denied('clipboard.read'),
-      write: () => denied('clipboard.write'),
-      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false }
+      }
     })
     Object.defineProperty(navigator, 'clipboard', { value: clipboard, configurable: true, enumerable: true })
     window.__orcaHsClipboardShim = 'write-only'
@@ -88,27 +90,43 @@ const polyfills = `(() => {
 
 webFrame.executeJavaScript(polyfills).catch(() => {})
 
-// Isolated-world side of the shim: forward write requests from this document only, and only when
-// the document is the top-level frame. The main process re-validates everything.
+// Isolated-world side of the clipboard shim: forward write requests from this document only, and
+// only when the document is the top-level frame. Oversized payloads are dropped here before IPC.
+const MAX_TEXT_LENGTH = 1024 * 1024
 if (window.top === window) {
   window.addEventListener('message', async (e) => {
     if (e.source !== window || e.origin !== window.location.origin) return
     const data = e.data
     if (!data || data.type !== REQUEST || typeof data.id !== 'number' || typeof data.text !== 'string') return
     let result
-    try {
-      result = await ipcRenderer.invoke(CHANNEL, data.text)
-    } catch (err) {
-      result = { ok: false, reason: String(err && err.message) }
+    if (data.text.length > MAX_TEXT_LENGTH) {
+      result = { ok: false, reason: 'text exceeds 1 MiB' }
+    } else {
+      try {
+        result = await ipcRenderer.invoke(WRITE_CHANNEL, data.text)
+      } catch (err) {
+        result = { ok: false, reason: String(err && err.message) }
+      }
     }
     window.postMessage({ type: REPLY, id: data.id, ok: !!(result && result.ok), reason: result && result.reason }, window.location.origin)
   })
 }
 
-// Server picker bridge for the shell's own file:// pages. Remote (http) content never sees it.
-if (window.location.protocol === 'file:') {
+// Picker bridge for the shell's own pages. Remote (http) content never sees it; the main process
+// additionally verifies the exact page URL on every call.
+const isShellPage = window.location.protocol === 'file:' && /\/(prompt|offline|toast)\.html$/.test(decodeURIComponent(window.location.pathname))
+if (isShellPage && window.top === window) {
   contextBridge.exposeInMainWorld('orcaHs', {
     listServers: () => ipcRenderer.invoke('orca-hs:servers-list'),
-    removeServer: (origin) => ipcRenderer.invoke('orca-hs:servers-remove', String(origin))
+    removeServer: (origin) => ipcRenderer.invoke('orca-hs:servers-remove', String(origin)),
+    connect: (input) => ipcRenderer.invoke('orca-hs:connect', String(input)),
+    retry: () => ipcRenderer.invoke('orca-hs:retry'),
+    switchServer: () => ipcRenderer.invoke('orca-hs:switch'),
+    state: () => ipcRenderer.invoke('orca-hs:state'),
+    openRelease: () => ipcRenderer.invoke('orca-hs:open-release'),
+    updateState: () => ipcRenderer.invoke('orca-hs:update-state'),
+    updateInstall: () => ipcRenderer.invoke('orca-hs:update-install'),
+    updateDismiss: () => ipcRenderer.invoke('orca-hs:update-dismiss'),
+    onUpdateProgress: (cb) => { ipcRenderer.on('orca-hs:update-progress', (_e, payload) => cb(payload)) }
   })
 }

@@ -30,3 +30,16 @@ test('serialize/parse round-trips and tolerates junk', () => {
   assert.deepEqual(parse('not json'), [])
   assert.deepEqual(parse('{"servers":[{"origin":"ftp://x"},{"origin":"http://ok.example"}]}').map((s) => s.origin), ['http://ok.example'])
 })
+
+test('upsert keeps the launch path but drops hash and query', () => {
+  const list = upsert([], 'https://host.example/orca/web-index.html?x=1#code=secret', 9)
+  assert.equal(list[0].origin, 'https://host.example')
+  assert.equal(list[0].url, 'https://host.example/orca/web-index.html')
+  assert.equal(JSON.stringify(list).includes('secret'), false)
+})
+
+test('parse fills a missing or foreign url with the origin root', () => {
+  const parsed = parse('{"servers":[{"origin":"http://a.example:6768"},{"origin":"http://b.example","url":"http://evil.example/x"}]}')
+  assert.equal(parsed[0].url, 'http://a.example:6768/')
+  assert.equal(parsed[1].url, 'http://b.example/')
+})

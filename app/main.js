@@ -1,26 +1,47 @@
-// Orca High Sierra PoC shell: Electron 26 thin client that only loads a remote Orca server URL.
-const { app, BrowserWindow, Menu, shell, ipcMain, clipboard } = require('electron')
+// OrcaHS main process: an Electron 26 shell that loads a Remote Orca Server's web UI and nothing else.
+const { app, BrowserWindow, Menu, shell, ipcMain, clipboard, dialog } = require('electron')
 const fs = require('fs')
 const path = require('path')
+const { pathToFileURL } = require('url')
 const pkg = require('./package.json')
-const { resolvePairInput, persistableUrl } = require('./pair-link')
+const { resolvePairInput } = require('./pair-link')
 const { createClipboardPolicy } = require('./clipboard-policy')
 const servers = require('./servers-store')
+const { scrub, safeUrl, truncate } = require('./log-scrub')
+const { createNavPolicy } = require('./nav-policy')
+const { resolveBaseDir } = require('./base-dir')
+const updates = require('./update-check')
+const updater = require('./updater')
+const https = require('https')
 
 const argv = process.argv.slice(1)
 const debug = argv.includes('--hs-debug')
-if (argv.includes('--version')) { process.stdout.write(`${pkg.productName} ${pkg.version} (Electron ${process.versions.electron})\n`); app.exit(0) }
+if (argv.includes('--version')) {
+  process.stdout.write(`${pkg.productName} ${pkg.version} (Electron ${process.versions.electron})\n`)
+  app.exit(0)
+}
 function argValue(name) {
   const hit = argv.find((a) => a.startsWith(`--${name}=`))
   return hit ? hit.slice(name.length + 3) : undefined
 }
 
-// Keep every write inside one directory. Default is the standard per-user app data folder;
-// --base-dir=<dir> moves all of it (profile, logs, server list) somewhere else, e.g. a USB stick.
-const baseDir = argValue('base-dir') || path.join(app.getPath('appData'), pkg.productName)
+// ---------------------------------------------------------------------------------------------
+// Storage: everything the app writes lives under baseDir, private to the user.
+// ---------------------------------------------------------------------------------------------
+const baseDirInfo = resolveBaseDir({
+  argBaseDir: argValue('base-dir'),
+  execPath: process.execPath,
+  appData: app.getPath('appData'),
+  productName: pkg.productName,
+  exists: (p) => { try { return fs.statSync(p).isDirectory() } catch { return false } }
+})
+const baseDir = baseDirInfo.dir
 const userData = path.join(baseDir, 'userdata')
 const logsDir = path.join(baseDir, 'logs')
-for (const dir of [userData, logsDir]) fs.mkdirSync(dir, { recursive: true })
+for (const dir of [baseDir, userData, logsDir]) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  try { fs.chmodSync(dir, 0o700) } catch {}
+}
 app.setPath('userData', userData)
 app.setPath('sessionData', userData)
 app.setPath('logs', logsDir)
@@ -28,17 +49,16 @@ app.setPath('crashDumps', path.join(baseDir, 'crashes'))
 app.setPath('temp', path.join(baseDir, 'tmp'))
 app.commandLine.appendSwitch('disk-cache-dir', path.join(userData, 'cache'))
 app.commandLine.appendSwitch('use-mock-keychain')
+app.setName(pkg.productName)
 
-
-// Owner rule: nothing may remain outside the base directory. macOS itself creates these
-// three app-scoped locations (saved window state, Metal shader cache, cfprefsd plist);
-// remove them on every start and quit so the machine stays clean.
+// macOS creates a few app-scoped locations outside baseDir for every app (saved window state,
+// shader cache, preferences). Remove them on start and quit so the app leaves no trace elsewhere.
+// This is best effort: a crash or SIGKILL skips the quit-time pass.
 const { execFileSync } = require('child_process')
+const bundleId = pkg.bundleId
 function sysDir(kind) {
   try { return execFileSync('/usr/bin/getconf', [kind]).toString().trim() } catch { return '' }
 }
-const bundleId = pkg.bundleId
-app.setName(pkg.productName)
 function cleanupSystemTraces() {
   const targets = []
   const tmp = sysDir('DARWIN_USER_TEMP_DIR'); if (tmp) targets.push(path.join(tmp, `${bundleId}.savedState`))
@@ -49,44 +69,127 @@ function cleanupSystemTraces() {
   try { fs.rmSync(path.join(app.getPath('home'), 'Library', 'Preferences', `${bundleId}.plist`), { force: true }) } catch {}
 }
 
+// ---------------------------------------------------------------------------------------------
+// Logging: every line is scrubbed of pairing material; file is private and size-bounded.
+// ---------------------------------------------------------------------------------------------
 const logFile = path.join(logsDir, `session-${Date.now()}.log`)
+const LOG_MAX_BYTES = 5 * 1024 * 1024
+let logBytes = 0
+let logDisabled = false
 function log(...parts) {
-  const line = `${new Date().toISOString()} ${parts.join(' ')}\n`
-  fs.appendFileSync(logFile, line)
+  if (logDisabled) return
+  const line = `${new Date().toISOString()} ${scrub(parts.join(' '))}\n`
+  logBytes += line.length
+  if (logBytes > LOG_MAX_BYTES) {
+    logDisabled = true
+    try { fs.appendFileSync(logFile, `${new Date().toISOString()} [log] size limit reached, logging stopped\n`, { mode: 0o600 }) } catch {}
+    return
+  }
+  try { fs.appendFileSync(logFile, line, { mode: 0o600 }) } catch { logDisabled = true }
 }
 
-const urlFile = path.join(baseDir, 'server-url.txt')
+// ---------------------------------------------------------------------------------------------
+// Known servers: data/servers.json. Entries hold the launch url (origin + path, never the hash)
+// and the origin used for trust decisions.
+// ---------------------------------------------------------------------------------------------
 const serversFile = path.join(baseDir, 'servers.json')
+const legacyUrlFile = path.join(baseDir, 'server-url.txt')
 function loadServers() {
-  try { return servers.parse(fs.readFileSync(serversFile, 'utf8')) } catch { return [] }
+  if (!fs.existsSync(serversFile)) return []
+  try { return servers.parse(fs.readFileSync(serversFile, 'utf8')) } catch (err) { log(`[servers] load failed: ${err && err.message}`); return [] }
 }
 function saveServers(list) {
-  try { fs.writeFileSync(serversFile, servers.serialize(list), { mode: 0o600 }) } catch (err) { log(`[servers] save failed: ${err && err.message}`) }
-}
-let serverList = loadServers()
-// Migrate the single remembered origin from earlier builds into the list.
-if (serverList.length === 0 && fs.existsSync(urlFile)) {
-  const o = servers.normalizeOrigin(fs.readFileSync(urlFile, 'utf8').trim())
-  if (o) { serverList = servers.upsert(serverList, o, 0); saveServers(serverList) }
-}
-
-// --url accepts an orca://pair link, a browser pairing URL, a bare code, or a server origin.
-// --prompt forces the server picker. Otherwise the most recently used server is opened.
-let targetUrl = null
-if (!argv.includes('--prompt')) {
-  const raw = argValue('url') || (serverList[0] ? serverList[0].origin : '')
-  if (raw) {
-    const r = resolvePairInput(raw)
-    if (r.error) log(`[pair-input] rejected: ${r.error}`)
-    else targetUrl = r.url
+  const tmp = `${serversFile}.tmp`
+  try {
+    fs.writeFileSync(tmp, servers.serialize(list), { mode: 0o600 })
+    fs.renameSync(tmp, serversFile)
+    return true
+  } catch (err) {
+    log(`[servers] save failed: ${err && err.message}`)
+    try { fs.rmSync(tmp, { force: true }) } catch {}
+    return false
   }
 }
+let serverList = loadServers()
+// One-time migration from the single-server file of pre-0.1 builds; the old file is removed so
+// a server the owner removed later cannot come back.
+if (!fs.existsSync(serversFile) && fs.existsSync(legacyUrlFile)) {
+  try {
+    const o = servers.normalizeOrigin(fs.readFileSync(legacyUrlFile, 'utf8').trim())
+    if (o) serverList = servers.upsert(serverList, `${o}/`, 0)
+    if (saveServers(serverList)) fs.rmSync(legacyUrlFile, { force: true })
+  } catch (err) { log(`[servers] migration failed: ${err && err.message}`) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Update reminder: once a day, GET the latest GitHub release and compare versions. Never
+// downloads or installs. Disabled with --no-update-check or "disabled": true in update-check.json.
+// ---------------------------------------------------------------------------------------------
+const updateStateFile = path.join(baseDir, 'update-check.json')
+function loadUpdateState() {
+  try { return JSON.parse(fs.readFileSync(updateStateFile, 'utf8')) } catch { return {} }
+}
+function saveUpdateState(state) {
+  try { fs.writeFileSync(updateStateFile, JSON.stringify(state, null, 2), { mode: 0o600 }) } catch (err) { log(`[update] save failed: ${err && err.message}`) }
+}
+let updateState = loadUpdateState()
+if (argv.includes('--no-update-check')) updateState.disabled = true
+let latestRelease = null // { version, url, name } when a newer release is known
+
+function fetchLatestRelease() {
+  return new Promise((resolve) => {
+    const req = https.get(updates.RELEASES_API, {
+      headers: { 'User-Agent': `${pkg.productName}/${pkg.version}`, Accept: 'application/vnd.github+json' },
+      timeout: 8000
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve({ error: `HTTP ${res.statusCode}` }) }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (c) => { body += c; if (body.length > 256 * 1024) { req.destroy(); resolve({ error: 'response too large' }) } })
+      res.on('end', () => resolve({ release: updates.parseLatestRelease(body) }))
+    })
+    req.on('timeout', () => { req.destroy(); resolve({ error: 'timeout' }) })
+    req.on('error', (err) => resolve({ error: err && err.message }))
+  })
+}
+
+async function checkForUpdate({ force = false, onResult } = {}) {
+  if (!force && !updates.shouldCheck(updateState)) return
+  if (updateState.disabled && !force) return
+  const r = await fetchLatestRelease()
+  updateState.lastCheckedAt = Date.now()
+  if (r.error || !r.release) {
+    log(`[update] check failed: ${r.error || 'unparseable response'}`)
+    saveUpdateState(updateState)
+    if (onResult) onResult({ error: r.error || 'could not read the release information' })
+    return
+  }
+  updateState.latestVersion = r.release.version
+  updateState.latestUrl = r.release.url
+  saveUpdateState(updateState)
+  const newer = updates.isNewer(r.release.version, pkg.version)
+  latestRelease = newer ? r.release : null
+  log(`[update] latest=${r.release.version} current=${pkg.version} newer=${newer}`)
+  if (onResult) onResult({ release: r.release, newer })
+}
+
+function openReleasePage(url) {
+  if (typeof url === 'string' && url.startsWith(updates.RELEASES_PAGE_PREFIX)) shell.openExternal(url)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Window
+// ---------------------------------------------------------------------------------------------
+const promptUrl = pathToFileURL(path.join(__dirname, 'prompt.html')).href
+const offlineUrl = pathToFileURL(path.join(__dirname, 'offline.html')).href
+const toastUrl = pathToFileURL(path.join(__dirname, 'toast.html')).href
+const navPolicy = createNavPolicy({ shellPages: [promptUrl, offlineUrl, toastUrl] })
 
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
-    title: 'Orca HS',
+    title: pkg.productName,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -96,162 +199,328 @@ function createWindow() {
     }
   })
   const wc = win.webContents
+  const ses = wc.session
 
-  // The only privileged bridge: write-only clipboard for the active server origin (see preload.js).
-  let allowedOrigin = null
-  wc.on('did-navigate', (_e, url) => {
-    try { const u = new URL(url); allowedOrigin = /^https?:$/.test(u.protocol) ? u.origin : null } catch { allowedOrigin = null }
-  })
-  // Server picker API, available only to the shell's own pages (file:// inside the app dir).
-  const appDirUrl = `file://${__dirname}/`
-  function fromShellPage(event) {
-    if (event.sender !== wc || event.senderFrame !== wc.mainFrame) return false
-    return String(event.senderFrame.url).startsWith(appDirUrl)
+  // Trust state. trustedOrigin changes only here, when the owner picks a server (picker, --url,
+  // last-used at startup). pendingTarget keeps the full connect URL (pairing hash included) in
+  // memory until the server page has loaded once, so a failed first pairing can be retried.
+  let trustedOrigin = null
+  let pendingTarget = null
+  let lastFailedUrl = null
+
+  function connectTo(input, source) {
+    const r = resolvePairInput(input)
+    if (r.error) { log(`[connect:${source}] rejected: ${r.error}`); return { ok: false, reason: r.error } }
+    if (r.scope && r.scope !== 'runtime') {
+      const reason = `pairing scope is "${r.scope}", expected "runtime"`
+      log(`[connect:${source}] rejected: ${reason}`)
+      return { ok: false, reason }
+    }
+    trustedOrigin = new URL(r.url).origin
+    pendingTarget = r.url
+    log(`[connect:${source}] ${safeUrl(r.url)}`)
+    win.loadURL(r.url)
+    return { ok: true }
   }
-  ipcMain.handle('orca-hs:servers-list', (event) => fromShellPage(event) ? serverList : [])
-  ipcMain.handle('orca-hs:servers-remove', async (event, origin) => {
-    if (!fromShellPage(event)) return { ok: false }
-    const o = servers.normalizeOrigin(origin)
-    if (!o) return { ok: false }
-    serverList = servers.remove(serverList, o)
+  function showPrompt() {
+    trustedOrigin = null
+    pendingTarget = null
+    win.loadFile(path.join(__dirname, 'prompt.html'))
+  }
+  function showOffline(code, desc) {
+    const params = new URLSearchParams({ code: String(code), desc: String(desc || '') })
+    win.loadFile(path.join(__dirname, 'offline.html'), { hash: params.toString() })
+  }
+  function retry() {
+    if (pendingTarget) { win.loadURL(pendingTarget); return { ok: true } }
+    if (trustedOrigin) {
+      const known = serverList.find((s) => s.origin === trustedOrigin)
+      win.loadURL(known ? known.url : `${trustedOrigin}/`)
+      return { ok: true }
+    }
+    return { ok: false, reason: 'no server selected' }
+  }
+
+  // --- Permissions: deny by default; the trusted server may write the clipboard and go fullscreen.
+  const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'fullscreen'])
+  const deniedOnce = new Set()
+  function allowPermission(permission, requestingOrigin) {
+    let origin = null
+    try { origin = new URL(String(requestingOrigin)).origin } catch {}
+    const ok = !!trustedOrigin && origin === trustedOrigin && ALLOWED_PERMISSIONS.has(permission)
+    if (!ok) {
+      const key = `${permission}@${origin}`
+      if (!deniedOnce.has(key)) { deniedOnce.add(key); log(`[permission] denied ${permission} for ${origin}`) }
+    }
+    return ok
+  }
+  ses.setPermissionRequestHandler((_wc, permission, callback, details) => {
+    callback(allowPermission(permission, details && details.requestingUrl))
+  })
+  ses.setPermissionCheckHandler((_wc, permission, requestingOrigin) => allowPermission(permission, requestingOrigin))
+  // No downloads: they would write outside baseDir and nothing in this client needs them.
+  ses.on('will-download', (event, item) => {
+    event.preventDefault()
+    log(`[download] blocked ${safeUrl(item.getURL())}`)
+  })
+
+  // --- Navigation: only the trusted server origin and the shell's own pages.
+  const guardNavigation = (event, url, what) => {
+    const v = navPolicy.allows(url, trustedOrigin)
+    if (!v.ok) {
+      event.preventDefault()
+      log(`[${what}] blocked ${safeUrl(url)}: ${v.reason}`)
+    }
+  }
+  wc.on('will-navigate', (e, url) => guardNavigation(e, url, 'navigate'))
+  wc.on('will-redirect', (e, url) => guardNavigation(e, url, 'redirect'))
+  wc.on('did-start-navigation', (_e, _url, _inPlace, isMainFrame) => { if (isMainFrame) lastFailedUrl = null })
+
+  // Links that want a new window: never a new Electron window. http(s) links go to the system
+  // browser only after the owner confirms in a native dialog, one at a time.
+  let externalDialogOpen = false
+  wc.setWindowOpenHandler(({ url }) => {
+    let parsed = null
+    try { parsed = new URL(url) } catch {}
+    if (!parsed || !/^https?:$/.test(parsed.protocol) || externalDialogOpen) {
+      log(`[window-open] blocked ${parsed ? parsed.host : 'invalid url'}`)
+      return { action: 'deny' }
+    }
+    externalDialogOpen = true
+    dialog.showMessageBox(win, {
+      type: 'question',
+      buttons: ['Open in Browser', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      message: `Open ${parsed.host} in your web browser?`,
+      detail: `${parsed.origin}${parsed.pathname}`
+    }).then(({ response }) => {
+      externalDialogOpen = false
+      if (response === 0) { shell.openExternal(url); log(`[window-open] opened ${parsed.host}`) }
+      else log(`[window-open] declined ${parsed.host}`)
+    }).catch(() => { externalDialogOpen = false })
+    return { action: 'deny' }
+  })
+
+  // --- Load outcome
+  wc.on('console-message', (_e, level, message, line, sourceId) => {
+    if (level >= 2 || debug) log(`[console:${level}] ${truncate(message)} (${safeUrl(sourceId)}:${line})`)
+  })
+  wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return // -3 = ERR_ABORTED, navigation superseded
+    log(`[did-fail-load] ${code} ${desc} ${safeUrl(url)}`)
+    if (navPolicy.isShellPage(url)) return
+    lastFailedUrl = String(url)
+    showOffline(code, desc)
+  })
+  wc.on('render-process-gone', (_e, d) => {
+    log(`[render-process-gone] ${JSON.stringify(d)}`)
+    showOffline('renderer', (d && d.reason) || 'renderer exited')
+  })
+  wc.on('did-finish-load', () => {
+    const current = wc.getURL()
+    log(`[did-finish-load] ${safeUrl(current)}`)
+    if (!/^https?:/.test(current) || current === lastFailedUrl) return
+    let origin = null
+    try { origin = new URL(current).origin } catch {}
+    if (!origin || origin !== trustedOrigin) return
+    pendingTarget = null // pairing consumed; the web client keeps it in its own storage
+    serverList = servers.upsert(serverList, current)
     saveServers(serverList)
-    // Forget the pairing kept by the web client for that origin (localStorage etc.).
-    try { await wc.session.clearStorageData({ origin: o }) } catch (err) { log(`[servers] clearStorageData failed: ${err && err.message}`) }
-    log(`[servers] removed ${o}`)
+  })
+
+  // --- IPC for the shell's own pages (exact file URLs, main frame, this window only)
+  function fromShellPage(event) {
+    return event.sender === wc && event.senderFrame === wc.mainFrame && navPolicy.isShellPage(event.senderFrame.url)
+  }
+  ipcMain.handle('orca-hs:servers-list', (event) => (fromShellPage(event) ? serverList : []))
+  ipcMain.handle('orca-hs:servers-remove', async (event, origin) => {
+    if (!fromShellPage(event)) return { ok: false, reason: 'not allowed' }
+    const o = servers.normalizeOrigin(origin)
+    if (!o) return { ok: false, reason: 'invalid origin' }
+    let cleared = true
+    try { await ses.clearStorageData({ origin: o }) } catch (err) { cleared = false; log(`[servers] clearStorageData failed: ${err && err.message}`) }
+    serverList = servers.remove(serverList, o)
+    const saved = saveServers(serverList)
+    if (trustedOrigin === o) { trustedOrigin = null; pendingTarget = null }
+    log(`[servers] removed ${o} cleared=${cleared} saved=${saved}`)
+    if (!cleared) return { ok: false, reason: 'removed from the list, but clearing its stored pairing failed; try again' }
+    if (!saved) return { ok: false, reason: 'pairing cleared, but saving the server list failed' }
     return { ok: true }
   })
+  ipcMain.handle('orca-hs:connect', (event, input) => (fromShellPage(event) ? connectTo(String(input), 'picker') : { ok: false, reason: 'not allowed' }))
+  ipcMain.handle('orca-hs:retry', (event) => (fromShellPage(event) ? retry() : { ok: false, reason: 'not allowed' }))
+  ipcMain.handle('orca-hs:switch', (event) => { if (fromShellPage(event)) showPrompt(); return { ok: true } })
+  ipcMain.handle('orca-hs:state', (event) => (fromShellPage(event)
+    ? { origin: trustedOrigin, pending: !!pendingTarget, version: pkg.version }
+    : {}))
+  ipcMain.handle('orca-hs:open-release', (event) => { if (fromShellPage(event) && latestRelease) openReleasePage(latestRelease.url); return { ok: true } })
 
+  // --- Clipboard: the one bridge for remote content. Write-only, policed in clipboard-policy.js.
   const clipboardPolicy = createClipboardPolicy()
   ipcMain.handle('orca-hs:clipboard-write-text', (event, text) => {
     const verdict = clipboardPolicy({
       senderIsWindow: event.sender === wc,
       frameIsMain: event.senderFrame === wc.mainFrame,
       frameUrl: event.senderFrame ? event.senderFrame.url : '',
-      allowedOrigin,
+      allowedOrigin: trustedOrigin,
       text
     })
-    if (!verdict.ok) {
-      log(`[clipboard] denied: ${verdict.reason}`)
-      return verdict
-    }
+    if (!verdict.ok) { log(`[clipboard] denied: ${verdict.reason}`); return verdict }
     clipboard.writeText(text)
     log(`[clipboard] wrote ${text.length} chars`)
     return { ok: true }
   })
-  wc.on('console-message', (_e, level, message, line, sourceId) => {
-    if (level >= 2 || debug) log(`[console:${level}] ${message} (${String(sourceId).split(/[#?]/)[0]}:${line})`)
-  })
 
-  // 4. Offline page: when the server page itself fails to load, show the shell's own page with
-  // retry / change-server instead of Chromium's error page. -3 is ERR_ABORTED (navigation
-  // superseded), which is not a failure.
-  let lastServerOrigin = null
-  let lastFailedUrl = null
-  wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
-    const shown = String(url).split(/[#?]/)[0]
-    log(`[did-fail-load] ${code} ${desc} ${shown}`)
-    if (!isMainFrame || code === -3 || !/^https?:/.test(shown)) return
-    lastFailedUrl = String(url)
-    let origin = lastServerOrigin
-    try { origin = new URL(shown).origin } catch {}
-    const params = new URLSearchParams({ origin: origin || '', code: String(code), desc })
-    win.loadFile(path.join(__dirname, 'offline.html'), { hash: params.toString() })
-  })
-  wc.on('render-process-gone', (_e, d) => {
-    log(`[render-process-gone] ${JSON.stringify(d)}`)
-    const params = new URLSearchParams({ origin: lastServerOrigin || '', code: 'renderer', desc: d && d.reason || 'renderer exited' })
-    win.loadFile(path.join(__dirname, 'offline.html'), { hash: params.toString() })
-  })
-  wc.on('did-finish-load', () => {
-    // Never log the hash or query: the pairing payload carries the runtime token.
-    let shown = wc.getURL()
-    try { const u = new URL(shown); shown = `${u.origin}${u.pathname}` } catch {}
-    log(`[did-finish-load] ${shown}`)
-  })
-  wc.on('will-navigate', (_e, url) => log(`[will-navigate] ${url.split(/[#?]/)[0]}`))
-  wc.setWindowOpenHandler(({ url }) => {
-    log(`[window-open blocked] ${url}`)
-    if (/^https?:/.test(url)) shell.openExternal(url)
-    return { action: 'deny' }
-  })
-  // Debug only: periodic screenshots so a run can be verified over SSH without screen access.
-  for (const delay of debug ? [8000, 25000, 60000] : []) {
-    setTimeout(async () => {
-      if (win.isDestroyed()) return
-      try {
-        const img = await wc.capturePage()
-        fs.writeFileSync(path.join(logsDir, `shot-${delay}.png`), img.toPNG())
-        log(`[shot] ${delay}`)
-      } catch (err) {
-        log(`[shot-error] ${delay} ${err && err.message}`)
-      }
-    }, delay)
-  }
-
-
-
-  // Debug only: fixed capability probe, logged once per load. No external input is executed.
-  wc.on('did-finish-load', async () => {
-    if (!debug) return
-    try {
-      const r = await wc.executeJavaScript(`(() => ({
-        polyfilled: window.__orcaHsPolyfills === true,
-        clipboardShim: window.__orcaHsClipboardShim || null,
-        clipboardApi: typeof (navigator.clipboard && navigator.clipboard.writeText),
-        webgl2: !!document.createElement('canvas').getContext('webgl2'),
-        webgl1: !!document.createElement('canvas').getContext('webgl'),
-        offscreenCanvas: typeof OffscreenCanvas !== 'undefined',
-        promiseWithResolvers: typeof Promise.withResolvers,
-        objectGroupBy: typeof Object.groupBy,
-        arrayToSorted: typeof [].toSorted,
-        secureContext: window.isSecureContext,
-        subtleCrypto: !!(window.crypto && window.crypto.subtle),
-        localStorageKeys: Object.keys(localStorage).length,
-        title: document.title,
-        dpr: window.devicePixelRatio,
-        viewport: [window.innerWidth, window.innerHeight]
-      }))()`, true)
-      log(`[probe] ${JSON.stringify(r)}`)
-    } catch (err) {
-      log(`[probe-error] ${err && err.message}`)
+  // --- Debug aids: periodic screenshots and a fixed capability probe, only with --hs-debug.
+  if (debug) {
+    for (const delay of [8000, 25000, 60000]) {
+      setTimeout(async () => {
+        if (win.isDestroyed()) return
+        try {
+          const img = await wc.capturePage()
+          fs.writeFileSync(path.join(logsDir, `shot-${delay}.png`), img.toPNG(), { mode: 0o600 })
+          log(`[shot] ${delay}`)
+        } catch (err) { log(`[shot-error] ${delay} ${err && err.message}`) }
+      }, delay)
     }
-  })
-
-  log(`[start] electron=${process.versions.electron} chrome=${process.versions.chrome} target=${targetUrl ? 'url' : 'prompt'} debug=${debug}`)
-  // After the server page loads, remember only its origin for the next launch. The pairing
-  // code itself stays in the page's localStorage (upstream web client behaviour), not on disk.
-  wc.on('did-finish-load', () => {
-    const current = wc.getURL()
-    if (!/^https?:/.test(current)) return
-    // Chromium's own error page also finishes loading; never remember a URL that just failed.
-    if (current === lastFailedUrl) { lastFailedUrl = null; return }
-    const origin = persistableUrl(current)
-    if (!origin) return
-    try { lastServerOrigin = new URL(current).origin } catch {}
-    serverList = servers.upsert(serverList, lastServerOrigin)
-    saveServers(serverList)
-    try { fs.writeFileSync(urlFile, origin, { mode: 0o600 }) } catch {}
-  })
-  if (targetUrl) {
-    win.loadURL(targetUrl)
-  } else {
-    win.loadFile(path.join(__dirname, 'prompt.html'))
+    wc.on('did-finish-load', async () => {
+      try {
+        const r = await wc.executeJavaScript(`(() => ({
+          polyfilled: window.__orcaHsPolyfills === true,
+          clipboardShim: window.__orcaHsClipboardShim || null,
+          clipboardApi: typeof (navigator.clipboard && navigator.clipboard.writeText),
+          webgl2: !!document.createElement('canvas').getContext('webgl2'),
+          offscreenCanvas: typeof OffscreenCanvas !== 'undefined',
+          promiseWithResolvers: typeof Promise.withResolvers,
+          secureContext: window.isSecureContext,
+          title: document.title,
+          dpr: window.devicePixelRatio,
+          viewport: [window.innerWidth, window.innerHeight]
+        }))()`, true)
+        log(`[probe] ${JSON.stringify(r)}`)
+      } catch (err) { log(`[probe-error] ${err && err.message}`) }
+    })
   }
-  return win
+
+  // --- Startup target: --prompt → picker; --url → that; else the most recently used server.
+  const startInput = argv.includes('--prompt') ? '' : (argValue('url') || (serverList[0] ? serverList[0].url : ''))
+  log(`[start] ${pkg.productName} ${pkg.version} electron=${process.versions.electron} chrome=${process.versions.chrome} data=${baseDirInfo.mode} debug=${debug}`)
+  if (!startInput || !connectTo(startInput, 'startup').ok) showPrompt()
+
+  // --- Update toast: a small frameless window pinned to the bottom-right of the main window,
+  // like the official client's. "Download and Install" runs app/updater.js; "Later" hides it
+  // until the next launch. It is a separate window, so it sits over the remote page too.
+  let toast = null
+  let progress = { stage: 'idle' }
+  function toastSend(channel, payload) { if (toast && !toast.isDestroyed()) toast.webContents.send(channel, payload) }
+  function positionToast() {
+    if (!toast || toast.isDestroyed() || win.isDestroyed()) return
+    const [w, h] = win.getSize(); const [x, y] = win.getPosition()
+    const [tw, th] = toast.getSize()
+    toast.setPosition(x + w - tw - 16, y + h - th - 16)
+  }
+  function showToast() {
+    if (!latestRelease || win.isDestroyed()) return
+    if (toast && !toast.isDestroyed()) { toastSend('orca-hs:update-progress', updateStateForPage()); return }
+    toast = new BrowserWindow({
+      parent: win, width: 380, height: 132, frame: false, transparent: true, resizable: false, movable: false,
+      minimizable: false, maximizable: false, fullscreenable: false, hasShadow: false, show: false, focusable: true,
+      webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, preload: path.join(__dirname, 'preload.js') }
+    })
+    toast.setMenu(null)
+    toast.webContents.on('will-navigate', (e) => e.preventDefault())
+    toast.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    toast.once('ready-to-show', () => { positionToast(); toast.show() })
+    toast.on('closed', () => { toast = null })
+    toast.loadFile(path.join(__dirname, 'toast.html'))
+    win.on('move', positionToast); win.on('resize', positionToast)
+  }
+  function hideToast() { if (toast && !toast.isDestroyed()) toast.close(); toast = null }
+  function updateStateForPage() { return { update: latestRelease, current: pkg.version, progress } }
+  function setProgress(p) { progress = p; toastSend('orca-hs:update-progress', updateStateForPage()) }
+
+  let installing = false
+  let lastLoggedBytes = 0
+  async function startInstall() {
+    lastLoggedBytes = 0
+    if (installing || !latestRelease) return { ok: false, reason: installing ? 'already running' : 'no update' }
+    installing = true
+    log(`[update] installing ${latestRelease.version}`)
+    try {
+      await updater.installUpdate({
+        release: latestRelease,
+        baseDir,
+        execPath: process.execPath,
+        userAgent: `${pkg.productName}/${pkg.version}`,
+        productName: pkg.productName,
+        onStage: (st) => {
+          if (st.stage !== 'download') { setProgress(st); log(`[update] ${st.stage}`); return }
+          // Progress events arrive per chunk: update the toast every 256 KiB, log every 8 MiB.
+          if (!progress.received || st.received - progress.received > 256 * 1024 || st.received === st.total) setProgress(st)
+          if (!lastLoggedBytes || st.received - lastLoggedBytes > 8 * 1024 * 1024 || st.received === st.total) { lastLoggedBytes = st.received; log(`[update] download ${st.received}/${st.total}`) }
+        },
+        relaunch: (newExec, backup) => {
+          updateState.cleanup = backup
+          saveUpdateState(updateState)
+          log(`[update] relaunching ${safeUrl(newExec)}`)
+          // Pass our own arguments explicitly (Electron does not when execPath is given) and drop
+          // the test-only --hs-update-now so the new version does not immediately update again.
+          app.relaunch({ execPath: newExec, args: argv.filter((a) => a !== '--hs-update-now') })
+          app.exit(0)
+        }
+      })
+      return { ok: true }
+    } catch (err) {
+      installing = false
+      const message = (err && err.message) || String(err)
+      log(`[update] failed: ${message}`)
+      setProgress({ stage: 'error', message })
+      return { ok: false, reason: message }
+    }
+  }
+
+  // Toast / picker IPC (shell pages only; fromShellPage covers toast.html too)
+  ipcMain.handle('orca-hs:update-state', (event) => (fromShellPage(event) ? updateStateForPage() : {}))
+  ipcMain.handle('orca-hs:update-install', (event) => (fromShellPage(event) ? startInstall() : { ok: false, reason: 'not allowed' }))
+  ipcMain.handle('orca-hs:update-dismiss', (event) => { if (fromShellPage(event)) { hideToast(); log('[update] dismissed') } return { ok: true } })
+
+  // Daily check a few seconds after launch (never delays the first page); hourly re-check of the
+  // 24 h interval. A newer release shows the toast. --hs-update-now (testing) installs immediately.
+  function onCheckResult({ newer }) {
+    if (!newer || win.isDestroyed()) return
+    showToast()
+    if (argv.includes('--hs-update-now')) startInstall()
+  }
+  setTimeout(() => checkForUpdate({ onResult: onCheckResult }), 5000)
+  setInterval(() => checkForUpdate({ onResult: onCheckResult }), 60 * 60 * 1000)
+  win.__orcaHs = { checkNow: () => checkForUpdate({ force: true, onResult: (r) => { onCheckResult(r); return r } }), showToast, hasUpdate: () => !!latestRelease }
+
+  return { win, showPrompt }
 }
 
-function buildMenu(win) {
+function buildMenu({ showPrompt, win }) {
   const template = [
     {
       label: app.name,
       submenu: [
         { role: 'about' },
-        { type: 'separator' },
         {
-          label: 'Switch Server…',
-          accelerator: 'CmdOrCtrl+Shift+S',
-          click: () => { if (!win.isDestroyed()) win.loadFile(path.join(__dirname, 'prompt.html')) }
+          label: 'Check for Updates…',
+          click: () => checkForUpdate({
+            force: true,
+            onResult: ({ release, newer, error }) => {
+              if (win.isDestroyed()) return
+              if (newer) { win.__orcaHs.showToast(); return }
+              dialog.showMessageBox(win, error
+                ? { type: 'warning', message: 'Could not check for updates', detail: String(error), buttons: ['OK'] }
+                : { type: 'info', message: 'You are up to date', detail: `${pkg.productName} ${pkg.version} is the latest release.`, buttons: ['OK'] }
+              ).catch(() => {})
+            }
+          })
         },
+        { type: 'separator' },
+        { label: 'Switch Server…', accelerator: 'CmdOrCtrl+Shift+S', click: showPrompt },
         { type: 'separator' },
         { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
         { type: 'separator' },
@@ -265,6 +534,12 @@ function buildMenu(win) {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
-app.whenReady().then(() => { cleanupSystemTraces(); buildMenu(createWindow()) })
+app.whenReady().then(() => {
+  cleanupSystemTraces()
+  updater.cleanupOldBundles(process.execPath, log)
+  if (updateState.cleanup) { delete updateState.cleanup; saveUpdateState(updateState) }
+  const { win, showPrompt } = createWindow()
+  buildMenu({ showPrompt, win })
+})
 app.on('will-quit', () => { cleanupSystemTraces(); log('[quit] cleanup done') })
 app.on('window-all-closed', () => app.quit())

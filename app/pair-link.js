@@ -61,8 +61,8 @@
         const code = codeFromParams(url.searchParams) ||
           (hash.startsWith('orca://pair') ? codeFromParams(new URL(hash).searchParams) : codeFromParams(new URLSearchParams(hash)))
         if (code) {
-          decodePayload(code) // validate
-          return { url: `${url.origin}${url.pathname}#code=${code}`, paired: true }
+          const payload = decodePayload(code)
+          return { url: `${url.origin}${url.pathname}#code=${code}`, scope: payload.scope, paired: true }
         }
         return { url: `${url.origin}${url.pathname}`, paired: false }
       }
