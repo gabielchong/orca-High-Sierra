@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>OrcaHS update</title>
+<style>
+  html, body { margin: 0; background: transparent; }
+  body { font: 13px -apple-system, sans-serif; color: #eee; }
+  .card { margin: 8px; padding: 14px 16px; background: #1e1e22; border: 1px solid #3a3a42; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+  .title { font-weight: 600; margin-bottom: 4px; }
+  .sub { opacity: .7; margin-bottom: 10px; min-height: 1.2em; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  button { font: 13px -apple-system, sans-serif; padding: 6px 12px; border-radius: 6px; border: 1px solid #555; background: #2a2a30; color: #eee; cursor: pointer; }
+  button.primary { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .bar { height: 6px; background: #333; border-radius: 3px; overflow: hidden; margin: 6px 0 10px; display: none; }
+  .bar > div { height: 100%; width: 0; background: #2f6fed; transition: width .2s; }
+  .err { color: #f77; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="title" id="title">Update available</div>
+  <div class="sub" id="sub"></div>
+  <div class="bar" id="bar"><div id="fill"></div></div>
+  <div class="row">
+    <button class="primary" id="install">Download and Install</button>
+    <button id="later">Later</button>
+    <button id="release" style="display:none">Open release page</button>
+  </div>
+</div>
+<script>
+  const api = window.orcaHs
+  const $ = (id) => document.getElementById(id)
+  const fmt = (n) => n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`
+
+  function render(st) {
+    if (!st) return
+    const { update, current, progress } = st
+    if (update) $('title').textContent = `OrcaHS ${update.version} is available`
+    if (!progress || progress.stage === 'idle') {
+      $('sub').textContent = `You have ${current}. The app will download, verify and restart.`
+      $('bar').style.display = 'none'
+      $('install').disabled = false
+      return
+    }
+    $('install').disabled = true
+    $('later').disabled = progress.stage === 'install' || progress.stage === 'relaunch'
+    if (progress.stage === 'download') {
+      $('bar').style.display = 'block'
+      const pct = progress.total ? Math.round(progress.received / progress.total * 100) : 0
+      $('fill').style.width = `${pct}%`
+      $('sub').textContent = progress.total ? `Downloading… ${fmt(progress.received)} of ${fmt(progress.total)} (${pct}%)` : `Downloading… ${fmt(progress.received)}`
+    } else if (progress.stage === 'verify') {
+      $('fill').style.width = '100%'; $('sub').textContent = 'Verifying checksum…'
+    } else if (progress.stage === 'unpack') {
+      $('sub').textContent = 'Unpacking…'
+    } else if (progress.stage === 'install') {
+      $('sub').textContent = 'Installing…'
+    } else if (progress.stage === 'relaunch') {
+      $('sub').textContent = 'Restarting OrcaHS…'
+    } else if (progress.stage === 'error') {
+      $('bar').style.display = 'none'
+      $('sub').innerHTML = ''
+      const e = document.createElement('span'); e.className = 'err'; e.textContent = `Update failed: ${progress.message}`
+      $('sub').appendChild(e)
+      $('install').textContent = 'Try again'
+      $('install').disabled = false
+      $('later').disabled = false
+      $('release').style.display = ''
+    }
+  }
+
+  $('install').onclick = () => api && api.updateInstall()
+  $('later').onclick = () => api && api.updateDismiss()
+  $('release').onclick = () => api && api.openRelease()
+  if (api) {
+    api.updateState().then(render)
+    api.onUpdateProgress(render)
+  }
+</script>
+</body>
+</html>

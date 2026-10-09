@@ -114,7 +114,7 @@ if (window.top === window) {
 
 // Picker bridge for the shell's own pages. Remote (http) content never sees it; the main process
 // additionally verifies the exact page URL on every call.
-const isShellPage = window.location.protocol === 'file:' && /\/(prompt|offline)\.html$/.test(decodeURIComponent(window.location.pathname))
+const isShellPage = window.location.protocol === 'file:' && /\/(prompt|offline|toast)\.html$/.test(decodeURIComponent(window.location.pathname))
 if (isShellPage && window.top === window) {
   contextBridge.exposeInMainWorld('orcaHs', {
     listServers: () => ipcRenderer.invoke('orca-hs:servers-list'),
@@ -122,6 +122,11 @@ if (isShellPage && window.top === window) {
     connect: (input) => ipcRenderer.invoke('orca-hs:connect', String(input)),
     retry: () => ipcRenderer.invoke('orca-hs:retry'),
     switchServer: () => ipcRenderer.invoke('orca-hs:switch'),
-    state: () => ipcRenderer.invoke('orca-hs:state')
+    state: () => ipcRenderer.invoke('orca-hs:state'),
+    openRelease: () => ipcRenderer.invoke('orca-hs:open-release'),
+    updateState: () => ipcRenderer.invoke('orca-hs:update-state'),
+    updateInstall: () => ipcRenderer.invoke('orca-hs:update-install'),
+    updateDismiss: () => ipcRenderer.invoke('orca-hs:update-dismiss'),
+    onUpdateProgress: (cb) => { ipcRenderer.on('orca-hs:update-progress', (_e, payload) => cb(payload)) }
   })
 }

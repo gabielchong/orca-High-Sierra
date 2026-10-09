@@ -73,11 +73,23 @@ Everything the app writes lives in one folder: `~/Library/Application Support/Or
 open -na /Applications/OrcaHS.app --args --base-dir="$HOME/OrcaHS-data"
 ```
 
-Inside the base directory: `servers.json` (your server list, no secrets), `userdata/` (the Chromium profile; it holds the pairing tokens in localStorage, unencrypted, just as a browser would), `logs/`. The directory is created with owner-only permissions. If you keep it on removable media, treat it like a saved browser session.
+Inside the base directory: `servers.json` (your server list, no secrets), `update-check.json` (when the release check last ran), `updates/` (download scratch space, emptied after each update), `userdata/` (the Chromium profile; it holds the pairing tokens in localStorage, unencrypted, just as a browser would), `logs/`. The directory is created with owner-only permissions. If you keep it on removable media, treat it like a saved browser session.
 
-Other flags: `--url=<pairing link or server url>` to connect to something specific (prefer pasting into the picker: command-line arguments are visible to other processes and shell history), `--prompt` to open the server picker, `--hs-debug` to log everything and take screenshots into `logs/`, `--version`.
+Other flags: `--url=<pairing link or server url>` to connect to something specific (prefer pasting into the picker: command-line arguments are visible to other processes and shell history), `--prompt` to open the server picker, `--no-update-check` to skip the daily release check, `--hs-debug` to log everything and take screenshots into `logs/`, `--version`.
 
 Logs are scrubbed of pairing codes and long tokens, and `--hs-debug` screenshots show whatever was on screen. Look through both before attaching them to a public issue.
+
+## Updates
+
+OrcaHS checks the GitHub Releases page once a day. When a newer version exists, a small notice appears in the bottom-right corner of the window, like in the official Orca client. **Download and Install** downloads the release zip, verifies its SHA-256 against the release's `SHA256SUMS.txt`, replaces the app bundle in place and restarts; **Later** hides the notice until the next launch. **OrcaHS → Check for Updates…** checks immediately.
+
+Details worth knowing:
+
+- Nothing is downloaded until you click. The check itself is one anonymous `GET` to `api.github.com` with the app's version in the User-Agent. Disable it with `--no-update-check`, or `"disabled": true` in `update-check.json` in the data folder.
+- The app must be in a folder you can write to (your home folder, or `/Applications` if you own it). Otherwise the notice offers the release page instead.
+- The previous version is kept next to the app as `OrcaHS.app.old-<timestamp>` until the new one starts successfully, then removed.
+- Files written by the app carry no quarantine flag, so Gatekeeper does not prompt after an in-app update.
+- Why not Electron's built-in updater: Squirrel.Mac only installs bundles whose code signature matches the running app, which requires an Apple Developer ID. OrcaHS is signed ad-hoc so anyone can build identical binaries without an Apple account, so it ships its own small updater (`app/updater.js`).
 
 ## Using it away from home
 
@@ -138,6 +150,9 @@ app/
   servers-store.js    paired-server list (pure functions over servers.json)
   prompt.html         server picker
   offline.html        shown when the server cannot be reached
+  toast.html          bottom-right update notice with download progress
+  update-check.js     release lookup and version comparison
+  updater.js          download, verify, swap the bundle, relaunch
   package.json        product name, version, bundle id
 test/                 unit tests (node --test)
 resources/            icon.png and the dependency-free script that generates it
