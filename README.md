@@ -95,6 +95,7 @@ Details worth knowing:
 - The app must be in a folder you can write to (your home folder, or `/Applications` if you own it). Otherwise the notice offers the release page instead.
 - The previous version is kept next to the app as `OrcaHS.app.old-<timestamp>` until the new one starts successfully, then removed.
 - Files written by the app carry no quarantine flag, so Gatekeeper does not prompt after an in-app update.
+- If a release changes the app icon, macOS 10.13 may keep showing the previous icon for the running app until the next reboot; see [Troubleshooting](#troubleshooting).
 - Why not Electron's built-in updater: Squirrel.Mac only installs bundles whose code signature matches the running app, which requires an Apple Developer ID. OrcaHS is signed ad-hoc so anyone can build identical binaries without an Apple account, so it ships its own small updater (`app/updater.js`).
 
 ## Using it away from home
@@ -187,8 +188,11 @@ node --test test/*.test.js
   `/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /path/to/OrcaHS.app`
   and try again, or start `OrcaHS.app/Contents/MacOS/OrcaHS` directly.
 - **Two OrcaHS icons in the Dock** after upgrading from a pre-release build: the pinned one points at the old bundle id. Drag it out and pin the new one.
-- **The Dock shows an old or oversized icon** after replacing the app: macOS caches icons per user. Clear the cache and restart the Dock:
-  `rm -rf "$(getconf DARWIN_USER_CACHE_DIR)/com.apple.dock.iconcache" "$(getconf DARWIN_USER_CACHE_DIR)/com.apple.iconservices"; killall Dock`
+- **The Dock shows an old icon for the running app** after the app was replaced in place (manual reinstall or in-app update) with a version whose icon changed. On macOS 10.13 the system icon daemon (`iconservicesd`, runs as root) keeps the icon it first rendered for a bundle *path* in memory. Restarting the Dock, clearing the user icon caches, re-registering with Launch Services or deleting `/Library/Caches/com.apple.iconservices.store` do not refresh it; only restarting the daemon does. Either reboot, or:
+  ```bash
+  sudo killall iconservicesd; killall Dock
+  ```
+  Moving the app to a different folder also shows the new icon immediately. Fresh installs are never affected. (Found by replacing bundles at the same path on a 10.13.6 machine: the stale icon followed the path, not the bundle, and disappeared after a reboot.)
 - **Blank page or a Chromium error instead of Orca.** Run with `--hs-debug` and look in `logs/session-*.log` for `[console:3]` lines; attach them to an issue.
 - **Which version is installed?** `OrcaHS.app/Contents/MacOS/OrcaHS --version`
 
