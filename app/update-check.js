@@ -43,6 +43,9 @@ function parseLatestRelease(json) {
   return { version, url, name: typeof data.name === 'string' ? data.name : `v${version}`, zip, sums }
 }
 
+// Floor between two launch-time checks: a user relaunching repeatedly should not hammer the API.
+const STARTUP_INTERVAL_MS = 60 * 1000
+
 function shouldCheck(state, now = Date.now(), interval = CHECK_INTERVAL_MS) {
   if (!state || state.disabled) return false
   const last = Number(state.lastCheckedAt) || 0
@@ -62,4 +65,4 @@ function expectedSha256(sumsText, filename) {
   return null
 }
 
-module.exports = { RELEASES_API, RELEASES_PAGE_PREFIX, ASSET_PREFIX, CHECK_INTERVAL_MS, parseVersion, compareVersions, parseLatestRelease, shouldCheck, isNewer, expectedSha256 }
+module.exports = { RELEASES_API, RELEASES_PAGE_PREFIX, ASSET_PREFIX, CHECK_INTERVAL_MS, STARTUP_INTERVAL_MS, parseVersion, compareVersions, parseLatestRelease, shouldCheck, isNewer, expectedSha256 }
