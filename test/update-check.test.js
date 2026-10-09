@@ -1,6 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { compareVersions, parseLatestRelease, shouldCheck, isNewer, expectedSha256, CHECK_INTERVAL_MS } = require('../app/update-check')
+const { compareVersions, parseLatestRelease, shouldCheck, isNewer, expectedSha256, CHECK_INTERVAL_MS, STARTUP_INTERVAL_MS } = require('../app/update-check')
 
 test('compareVersions orders semver and treats pre-releases as older', () => {
   assert.ok(compareVersions('0.1.1', '0.1.0') > 0)
@@ -28,6 +28,9 @@ test('shouldCheck honours the interval and the disabled flag', () => {
   assert.equal(shouldCheck({ lastCheckedAt: now - CHECK_INTERVAL_MS - 1 }, now), true)
   assert.equal(shouldCheck({ disabled: true }, now), false)
   assert.equal(shouldCheck(null, now), false)
+  // launch-time check: a check from earlier today must not suppress it, only a check within the last minute does
+  assert.equal(shouldCheck({ lastCheckedAt: now - 2 * 60 * 60 * 1000 }, now, STARTUP_INTERVAL_MS), true)
+  assert.equal(shouldCheck({ lastCheckedAt: now - 10 * 1000 }, now, STARTUP_INTERVAL_MS), false)
 })
 
 test('isNewer', () => {

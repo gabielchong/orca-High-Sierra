@@ -153,9 +153,11 @@ function fetchLatestRelease() {
   })
 }
 
-async function checkForUpdate({ force = false, onResult } = {}) {
-  if (!force && !updates.shouldCheck(updateState)) return
+// force: manual "Check for Updates" (ignores interval and the disabled flag).
+// startup: every launch checks, like the official client, with a one-minute floor against rapid relaunches.
+async function checkForUpdate({ force = false, startup = false, onResult } = {}) {
   if (updateState.disabled && !force) return
+  if (!force && !updates.shouldCheck(updateState, Date.now(), startup ? updates.STARTUP_INTERVAL_MS : updates.CHECK_INTERVAL_MS)) return
   const r = await fetchLatestRelease()
   updateState.lastCheckedAt = Date.now()
   if (r.error || !r.release) {
@@ -496,7 +498,7 @@ function createWindow() {
     showToast()
     if (argv.includes('--hs-update-now')) startInstall()
   }
-  setTimeout(() => checkForUpdate({ onResult: onCheckResult }), 5000)
+  setTimeout(() => checkForUpdate({ startup: true, onResult: onCheckResult }), 5000)
   setInterval(() => checkForUpdate({ onResult: onCheckResult }), 60 * 60 * 1000)
   win.__orcaHs = { checkNow: () => checkForUpdate({ force: true, onResult: (r) => { onCheckResult(r); return r } }), showToast, hasUpdate: () => !!latestRelease }
 
