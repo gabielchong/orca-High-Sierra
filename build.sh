@@ -99,7 +99,11 @@ rm -rf "$DMG_ROOT" "$ICONSET"
 if ! unzip -l "$ZIP_OUT" | grep "licenses/LICENSES.chromium.html" >/dev/null; then echo "license notices missing from $ZIP_OUT" >&2; exit 1; fi
 file "$APP_DIR/Contents/MacOS/$PRODUCT" | grep -q x86_64 || echo "warning: main binary is not x86_64" >&2
 
+# Checksums the in-app updater verifies against (uploaded next to the zip on the release).
+SUMS_OUT="$OUT/SHA256SUMS.txt"
+( cd "$OUT" && shasum -a 256 "$(basename "$ZIP_OUT")" "$(basename "$DMG_OUT")" > "$SUMS_OUT" )
+
 echo "built:"
-for f in "$ZIP_OUT" "$DMG_OUT"; do echo "  $f  $(shasum -a 256 "$f" | cut -c1-16)  $(du -h "$f" | cut -f1)"; done
+for f in "$ZIP_OUT" "$DMG_OUT" "$SUMS_OUT"; do echo "  $f  $(shasum -a 256 "$f" | cut -c1-16)  $(du -h "$f" | cut -f1)"; done
 echo "install on target (zip): unzip into ~/Desktop/$PRODUCT, then:"
 echo "  open -na ~/Desktop/$PRODUCT/$PRODUCT.app --args --base-dir=\$HOME/Desktop/$PRODUCT/data"
