@@ -1,12 +1,15 @@
 // Orca High Sierra PoC shell: Electron 26 thin client that only loads a remote Orca server URL.
-const { app, BrowserWindow, shell, ipcMain, clipboard } = require('electron')
+const { app, BrowserWindow, Menu, shell, ipcMain, clipboard } = require('electron')
 const fs = require('fs')
 const path = require('path')
+const pkg = require('./package.json')
 const { resolvePairInput, persistableUrl } = require('./pair-link')
 const { createClipboardPolicy } = require('./clipboard-policy')
+const servers = require('./servers-store')
 
 const argv = process.argv.slice(1)
 const debug = argv.includes('--hs-debug')
+if (argv.includes('--version')) { process.stdout.write(`${pkg.productName} ${pkg.version} (Electron ${process.versions.electron})\n`); app.exit(0) }
 function argValue(name) {
   const hit = argv.find((a) => a.startsWith(`--${name}=`))
   return hit ? hit.slice(name.length + 3) : undefined
@@ -33,7 +36,8 @@ const { execFileSync } = require('child_process')
 function sysDir(kind) {
   try { return execFileSync('/usr/bin/getconf', [kind]).toString().trim() } catch { return '' }
 }
-const bundleId = 'dev.hs.orca-poc'
+const bundleId = pkg.bundleId
+app.setName(pkg.productName)
 function cleanupSystemTraces() {
   const targets = []
   const tmp = sysDir('DARWIN_USER_TEMP_DIR'); if (tmp) targets.push(path.join(tmp, `${bundleId}.savedState`))
@@ -51,10 +55,25 @@ function log(...parts) {
 }
 
 const urlFile = path.join(baseDir, 'server-url.txt')
+const serversFile = path.join(baseDir, 'servers.json')
+function loadServers() {
+  try { return servers.parse(fs.readFileSync(serversFile, 'utf8')) } catch { return [] }
+}
+function saveServers(list) {
+  try { fs.writeFileSync(serversFile, servers.serialize(list), { mode: 0o600 }) } catch (err) { log(`[servers] save failed: ${err && err.message}`) }
+}
+let serverList = loadServers()
+// Migrate the single remembered origin from earlier builds into the list.
+if (serverList.length === 0 && fs.existsSync(urlFile)) {
+  const o = servers.normalizeOrigin(fs.readFileSync(urlFile, 'utf8').trim())
+  if (o) { serverList = servers.upsert(serverList, o, 0); saveServers(serverList) }
+}
+
 // --url accepts an orca://pair link, a browser pairing URL, a bare code, or a server origin.
+// --prompt forces the server picker. Otherwise the most recently used server is opened.
 let targetUrl = null
-{
-  const raw = argValue('url') || (fs.existsSync(urlFile) ? fs.readFileSync(urlFile, 'utf8').trim() : '')
+if (!argv.includes('--prompt')) {
+  const raw = argValue('url') || (serverList[0] ? serverList[0].origin : '')
   if (raw) {
     const r = resolvePairInput(raw)
     if (r.error) log(`[pair-input] rejected: ${r.error}`)
@@ -82,6 +101,25 @@ function createWindow() {
   wc.on('did-navigate', (_e, url) => {
     try { const u = new URL(url); allowedOrigin = /^https?:$/.test(u.protocol) ? u.origin : null } catch { allowedOrigin = null }
   })
+  // Server picker API, available only to the shell's own pages (file:// inside the app dir).
+  const appDirUrl = `file://${__dirname}/`
+  function fromShellPage(event) {
+    if (event.sender !== wc || event.senderFrame !== wc.mainFrame) return false
+    return String(event.senderFrame.url).startsWith(appDirUrl)
+  }
+  ipcMain.handle('orca-hs:servers-list', (event) => fromShellPage(event) ? serverList : [])
+  ipcMain.handle('orca-hs:servers-remove', async (event, origin) => {
+    if (!fromShellPage(event)) return { ok: false }
+    const o = servers.normalizeOrigin(origin)
+    if (!o) return { ok: false }
+    serverList = servers.remove(serverList, o)
+    saveServers(serverList)
+    // Forget the pairing kept by the web client for that origin (localStorage etc.).
+    try { await wc.session.clearStorageData({ origin: o }) } catch (err) { log(`[servers] clearStorageData failed: ${err && err.message}`) }
+    log(`[servers] removed ${o}`)
+    return { ok: true }
+  })
+
   const clipboardPolicy = createClipboardPolicy()
   ipcMain.handle('orca-hs:clipboard-write-text', (event, text) => {
     const verdict = clipboardPolicy({
@@ -189,6 +227,8 @@ function createWindow() {
     const origin = persistableUrl(current)
     if (!origin) return
     try { lastServerOrigin = new URL(current).origin } catch {}
+    serverList = servers.upsert(serverList, lastServerOrigin)
+    saveServers(serverList)
     try { fs.writeFileSync(urlFile, origin, { mode: 0o600 }) } catch {}
   })
   if (targetUrl) {
@@ -196,8 +236,34 @@ function createWindow() {
   } else {
     win.loadFile(path.join(__dirname, 'prompt.html'))
   }
+  return win
 }
 
-app.whenReady().then(() => { cleanupSystemTraces(); createWindow() })
+function buildMenu(win) {
+  const template = [
+    {
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        {
+          label: 'Switch Server…',
+          accelerator: 'CmdOrCtrl+Shift+S',
+          click: () => { if (!win.isDestroyed()) win.loadFile(path.join(__dirname, 'prompt.html')) }
+        },
+        { type: 'separator' },
+        { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' }
+      ]
+    },
+    { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
+    { label: 'View', submenu: [{ role: 'reload' }, { role: 'togglefullscreen' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }] },
+    { label: 'Window', submenu: [{ role: 'minimize' }, { role: 'zoom' }, { role: 'close' }] }
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}
+
+app.whenReady().then(() => { cleanupSystemTraces(); buildMenu(createWindow()) })
 app.on('will-quit', () => { cleanupSystemTraces(); log('[quit] cleanup done') })
 app.on('window-all-closed', () => app.quit())

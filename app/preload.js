@@ -3,7 +3,7 @@
 // 2. On insecure (plain http) origins, where Chromium removes navigator.clipboard entirely, installs a
 //    write-only shim: writeText goes through postMessage to this preload, then IPC to the main process,
 //    which enforces the policy in clipboard-policy.js. Reads are rejected; use Cmd+V.
-const { webFrame, ipcRenderer } = require('electron')
+const { webFrame, ipcRenderer, contextBridge } = require('electron')
 
 const CHANNEL = 'orca-hs:clipboard-write-text'
 const REQUEST = 'orca-hs:clipboard:request'
@@ -102,5 +102,13 @@ if (window.top === window) {
       result = { ok: false, reason: String(err && err.message) }
     }
     window.postMessage({ type: REPLY, id: data.id, ok: !!(result && result.ok), reason: result && result.reason }, window.location.origin)
+  })
+}
+
+// Server picker bridge for the shell's own file:// pages. Remote (http) content never sees it.
+if (window.location.protocol === 'file:') {
+  contextBridge.exposeInMainWorld('orcaHs', {
+    listServers: () => ipcRenderer.invoke('orca-hs:servers-list'),
+    removeServer: (origin) => ipcRenderer.invoke('orca-hs:servers-remove', String(origin))
   })
 }

@@ -17,29 +17,40 @@ app/
   preload.js          Chromium 116 缺的 ES2024 polyfill、write-only 剪貼簿 shim
   pair-link.js        把 orca://pair 連結 / browser URL / 裸 code 轉成 web client URL
   clipboard-policy.js 剪貼簿寫入的驗證規則
-  prompt.html         首次啟動的貼連結頁
+  prompt.html         server 選擇頁：列出配對過的 server、可切換 / 移除、貼新連結
+  servers-store.js    已配對 server 清單的純函式（讀寫 data/servers.json）
   offline.html        server 連不上時的重試 / 換 server 頁
-  package.json        Electron 入口宣告
+  package.json        名稱、版本、bundle id（build.sh 與主行程共用）
 test/                 node:test 單元測試
-build.sh              在現代 Mac 上下載 Electron 26、驗 checksum、組 OrcaHS.app、打 zip
+resources/            icon.png 與產生它的 make-icon.mjs
+build.sh              在現代 Mac 上下載 Electron 26、驗 checksum、組 OrcaHS.app（icon、bundle id、版本）、打 zip 與 dmg
 ```
 
 ## 建置（在現代 Mac 上）
 
 ```bash
-./build.sh            # 產出 dist/OrcaHS.zip
+./build.sh            # 產出 dist/OrcaHS-<version>.zip 與 .dmg
 ```
+
+版本、名稱、bundle id 都在 `app/package.json`。簽章是 ad-hoc；`icon.png` 可直接換成自己的圖，1024×1024 PNG。
 
 ## 安裝與執行（在 10.13 機器上）
 
 app 所有寫入都在 `--base-dir` 之下，不碰其他路徑。
 
 ```bash
-mkdir -p ~/Desktop/OrcaHS && cd ~/Desktop/OrcaHS && unzip OrcaHS.zip
+mkdir -p ~/Desktop/OrcaHS && cd ~/Desktop/OrcaHS && unzip OrcaHS-<version>.zip
 open -na ~/Desktop/OrcaHS/OrcaHS.app --args --base-dir=$HOME/Desktop/OrcaHS/data
 ```
 
-首次啟動出現貼連結頁，可貼：
+用 dmg 的話，拖到任何地方即可。從瀏覽器下載的副本帶 quarantine 標記，10.13 的 Gatekeeper 第一次會擋
+「來自未識別的開發者」：右鍵 → 打開，之後不再問。scp 過去的檔案沒有這個標記。
+
+啟動時自動開最近用過的 server。`Cmd+Shift+S`（選單 OrcaHS → Switch Server…）或 `--prompt` 回到 server 選擇頁，
+那裡列出配對過的 server，可連線或移除（移除會清掉該 origin 在本機的 localStorage，server 端的授權要到
+Settings → Remote Orca Servers 自己撤銷）。清單存在 `data/servers.json`。
+
+新增 server 時可貼：
 
 - `orca://pair?code=…`（Settings → Remote Orca Servers → Pair another Orca client）
 - `orca serve` 印出的 browser URL（`http://<server>:6768/#code=…`）
@@ -54,6 +65,14 @@ server 頁載入後只把 origin 寫回 `server-url.txt`（mode 600）；pairing
 加 `--hs-debug` 會在 `data/logs/` 多寫：啟動後 8/25/60 秒的視窗截圖、頁面能力探針（WebGL、polyfill、secure context）、
 所有 console 訊息。不加時只記錄 warning 以上的 console 訊息與載入事件。
 旗標名刻意不用 `--debug`，那個會被 Electron 當成 Node 旗標攔走。
+
+## 疑難排解
+
+- `open` 回報 `LSOpenURLsWithRole() failed ... error -10810`：同一路徑上換過 app 的 bundle id 或執行檔名，
+  10.13 的 LaunchServices 快取還是舊的。跑一次
+  `/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f <path>/OrcaHS.app`
+  再 `open`，或直接執行 `OrcaHS.app/Contents/MacOS/OrcaHS`。
+- `OrcaHS.app/Contents/MacOS/OrcaHS --version` 印出版本後退出，可用來確認安裝的是哪一版。
 
 ## 連不上 server 時
 
