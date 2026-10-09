@@ -19,11 +19,21 @@ Everything the app writes stays under `--base-dir`.
     mkdir -p ~/Desktop/OrcaHS && cd ~/Desktop/OrcaHS && unzip OrcaHS.zip
     open -na ~/Desktop/OrcaHS/OrcaHS.app --args --base-dir=$HOME/Desktop/OrcaHS/data
 
-First launch shows a prompt page: paste the server's browser URL
-(`http://<server>:6768/#code=<pairing code>`; the `code=` value is the same payload as in an
-`orca://pair?code=` link). After a successful pairing the environment is kept in the page's
-localStorage and the plain `http://<server>:6768/` URL reconnects; you can then delete
-`data/server-url.txt` so the token is no longer on disk.
+First launch shows a prompt page. Paste any of:
+
+- `orca://pair?code=…` (Settings → Remote Orca Servers → Pair another Orca client)
+- the browser URL printed by `orca serve` (`http://<server>:6768/#code=…`)
+- the bare pairing code
+- a server URL you already paired with (`http://<server>:6768/`)
+
+All of them carry the same payload; `app/pair-link.js` turns them into the URL the web client
+expects. The same inputs work for `--url=` on the command line and for `data/server-url.txt`.
+After the server page loads, only the server origin is written back to `server-url.txt`
+(mode 600); the pairing code lives in the page's localStorage, as in the upstream web client.
+
+## Tests
+
+    node --test test/pair-link.test.js
 
 ## Known gaps on Chromium 116
 

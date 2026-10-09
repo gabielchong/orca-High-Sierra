@@ -2,6 +2,7 @@
 const { app, BrowserWindow, shell } = require('electron')
 const fs = require('fs')
 const path = require('path')
+const { resolvePairInput, persistableUrl } = require('./pair-link')
 
 const argv = process.argv.slice(1)
 function argValue(name) {
@@ -48,20 +49,16 @@ function log(...parts) {
 }
 
 const urlFile = path.join(baseDir, 'server-url.txt')
-let targetUrl = argValue('url')
-if (!targetUrl && fs.existsSync(urlFile)) targetUrl = fs.readFileSync(urlFile, 'utf8').trim()
-
-const promptPage = `data:text/html;charset=utf-8,${encodeURIComponent(`
-<!doctype html><meta charset="utf-8"><title>Orca HS</title>
-<body style="font:14px -apple-system,sans-serif;padding:24px;background:#111;color:#eee">
-<h2>Orca High Sierra client</h2>
-<p>Paste the Orca server browser URL (from <code>orca serve</code> or Settings → Remote Orca Servers), then press Connect.</p>
-<input id="u" style="width:100%;padding:8px;font-size:13px" placeholder="http://192.168.1.11:6768/...">
-<p><button id="go" style="padding:8px 16px">Connect</button></p>
-<p style="opacity:.6">Chromium ${process.versions.chrome} · Electron ${process.versions.electron} · ${process.platform} ${process.arch}</p>
-<script>
-document.getElementById('go').onclick=()=>{const v=document.getElementById('u').value.trim();if(v)location.href=v+(v.includes('#')?'':'#')+'&orcahs=1'}
-</script></body>`)}`
+// --url accepts an orca://pair link, a browser pairing URL, a bare code, or a server origin.
+let targetUrl = null
+{
+  const raw = argValue('url') || (fs.existsSync(urlFile) ? fs.readFileSync(urlFile, 'utf8').trim() : '')
+  if (raw) {
+    const r = resolvePairInput(raw)
+    if (r.error) log(`[pair-input] rejected: ${r.error}`)
+    else targetUrl = r.url
+  }
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -135,12 +132,18 @@ function createWindow() {
   })
 
   log(`[start] electron=${process.versions.electron} chrome=${process.versions.chrome} target=${targetUrl ? 'url' : 'prompt'}`)
+  // After the server page loads, remember only its origin for the next launch. The pairing
+  // code itself stays in the page's localStorage (upstream web client behaviour), not on disk.
+  wc.on('did-finish-load', () => {
+    const current = wc.getURL()
+    if (!/^https?:/.test(current)) return
+    const origin = persistableUrl(current)
+    if (origin) { try { fs.writeFileSync(urlFile, origin, { mode: 0o600 }) } catch {} }
+  })
   if (targetUrl) {
-    // Remember the URL for the next launch, hash (token) included, inside baseDir only.
-    fs.writeFileSync(urlFile, targetUrl)
     win.loadURL(targetUrl)
   } else {
-    win.loadURL(promptPage)
+    win.loadFile(path.join(__dirname, 'prompt.html'))
   }
 }
 
