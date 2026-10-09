@@ -168,6 +168,10 @@ node --test test/*.test.js
 
 OrcaHS is an independent community client. It is not affiliated with or endorsed by Stably AI. It contains no Orca code; it loads the web client that your own Orca server serves. Orca itself is MIT licensed at [stablyai/orca](https://github.com/stablyai/orca).
 
+## License
+
+MIT. See [LICENSE](LICENSE). Electron is distributed under its own MIT license; the bundled Chromium and Node components carry their respective licenses inside the app bundle (`LICENSES.chromium.html`).
+
 ## Contributing
 
 Issues and pull requests are welcome, especially:
