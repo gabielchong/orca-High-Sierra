@@ -1,0 +1,9 @@
+{
+  "name": "orcahs",
+  "productName": "OrcaHS",
+  "version": "0.1.0",
+  "description": "Thin Orca client for macOS 10.13 High Sierra",
+  "bundleId": "dev.orcahs.client",
+  "main": "main.js",
+  "private": true
+}

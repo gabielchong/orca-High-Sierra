@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Orca HS — server unreachable</title>
+<style>
+  body { font: 14px -apple-system, sans-serif; padding: 24px; background: #111; color: #eee; max-width: 760px; }
+  button { padding: 8px 16px; font-size: 13px; margin-right: 8px; }
+  code { background: #222; padding: 1px 4px; }
+  .dim { opacity: .6 }
+</style>
+</head>
+<body>
+<h2>Cannot reach the Orca server</h2>
+<p id="target"></p>
+<p class="dim" id="detail"></p>
+<p>
+  <button id="retry">Retry now</button>
+  <button id="change">Use another server</button>
+  <span class="dim" id="auto"></span>
+</p>
+<ul class="dim">
+  <li>Is the server Mac awake and Orca running there?</li>
+  <li>Are both machines on the same network (or is the SSH tunnel up)?</li>
+  <li>If the server was updated, pairing may need to be redone from Settings → Remote Orca Servers.</li>
+</ul>
+<script>
+  const params = new URLSearchParams(location.hash.replace(/^#/, ''))
+  const origin = params.get('origin') || ''
+  const code = params.get('code') || ''
+  const desc = params.get('desc') || ''
+  document.getElementById('target').textContent = origin ? `Server: ${origin}` : 'No server configured.'
+  document.getElementById('detail').textContent = [code, desc].filter(Boolean).join(' ')
+  const go = () => { if (origin) location.href = origin }
+  document.getElementById('retry').onclick = go
+  document.getElementById('change').onclick = () => { location.href = 'prompt.html' }
+  // Poll the server; an opaque no-cors response means it answered, so navigate back.
+  let seconds = 10
+  const auto = document.getElementById('auto')
+  async function tick() {
+    if (!origin) return
+    if (seconds <= 0) {
+      auto.textContent = 'checking…'
+      try {
+        await fetch(origin, { mode: 'no-cors', cache: 'no-store' })
+        go()
+        return
+      } catch {
+        seconds = 10
+      }
+    }
+    auto.textContent = `auto-retry in ${seconds}s`
+    seconds--
+    setTimeout(tick, 1000)
+  }
+  tick()
+</script>
+</body>
+</html>
