@@ -9,6 +9,7 @@ const { createClipboardPolicy } = require('./clipboard-policy')
 const servers = require('./servers-store')
 const { scrub, safeUrl, truncate } = require('./log-scrub')
 const { createNavPolicy } = require('./nav-policy')
+const { resolveBaseDir } = require('./base-dir')
 const updates = require('./update-check')
 const updater = require('./updater')
 const https = require('https')
@@ -27,7 +28,14 @@ function argValue(name) {
 // ---------------------------------------------------------------------------------------------
 // Storage: everything the app writes lives under baseDir, private to the user.
 // ---------------------------------------------------------------------------------------------
-const baseDir = argValue('base-dir') || path.join(app.getPath('appData'), pkg.productName)
+const baseDirInfo = resolveBaseDir({
+  argBaseDir: argValue('base-dir'),
+  execPath: process.execPath,
+  appData: app.getPath('appData'),
+  productName: pkg.productName,
+  exists: (p) => { try { return fs.statSync(p).isDirectory() } catch { return false } }
+})
+const baseDir = baseDirInfo.dir
 const userData = path.join(baseDir, 'userdata')
 const logsDir = path.join(baseDir, 'logs')
 for (const dir of [baseDir, userData, logsDir]) {
@@ -397,7 +405,7 @@ function createWindow() {
 
   // --- Startup target: --prompt → picker; --url → that; else the most recently used server.
   const startInput = argv.includes('--prompt') ? '' : (argValue('url') || (serverList[0] ? serverList[0].url : ''))
-  log(`[start] ${pkg.productName} ${pkg.version} electron=${process.versions.electron} chrome=${process.versions.chrome} debug=${debug}`)
+  log(`[start] ${pkg.productName} ${pkg.version} electron=${process.versions.electron} chrome=${process.versions.chrome} data=${baseDirInfo.mode} debug=${debug}`)
   if (!startInput || !connectTo(startInput, 'startup').ok) showPrompt()
 
   // --- Update toast: a small frameless window pinned to the bottom-right of the main window,

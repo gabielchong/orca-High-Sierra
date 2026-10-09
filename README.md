@@ -67,7 +67,13 @@ Launch OrcaHS, paste the `orca://pair?code=…` link into the box and press **Co
 
 ### Where OrcaHS keeps its data
 
-Everything the app writes lives in one folder: `~/Library/Application Support/OrcaHS` by default. Pass `--base-dir` to put all of it somewhere else, for example on a USB stick or a folder you can delete in one go; nothing is then written anywhere else:
+Everything the app writes lives in one folder. Resolution order:
+
+1. `--base-dir=<folder>` on the command line.
+2. **Portable mode:** a folder named `OrcaHS-data` next to `OrcaHS.app`. Create it once and every launch, including from the Dock or Finder, keeps all data there. Good for a USB stick, or for keeping an old Mac tidy.
+3. Otherwise `~/Library/Application Support/OrcaHS`.
+
+Example with an explicit folder:
 
 ```bash
 open -na /Applications/OrcaHS.app --args --base-dir="$HOME/OrcaHS-data"
@@ -154,6 +160,7 @@ app/
   update-check.js     release lookup and version comparison
   updater.js          download, verify, swap the bundle, relaunch
   package.json        product name, version, bundle id
+  base-dir.js         data folder resolution (--base-dir, portable folder, Application Support)
 test/                 unit tests (node --test)
 resources/            icon.png and the dependency-free script that generates it
 build.sh              packaging script
@@ -180,6 +187,8 @@ node --test test/*.test.js
   `/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /path/to/OrcaHS.app`
   and try again, or start `OrcaHS.app/Contents/MacOS/OrcaHS` directly.
 - **Two OrcaHS icons in the Dock** after upgrading from a pre-release build: the pinned one points at the old bundle id. Drag it out and pin the new one.
+- **The Dock shows an old or oversized icon** after replacing the app: macOS caches icons per user. Clear the cache and restart the Dock:
+  `rm -rf "$(getconf DARWIN_USER_CACHE_DIR)/com.apple.dock.iconcache" "$(getconf DARWIN_USER_CACHE_DIR)/com.apple.iconservices"; killall Dock`
 - **Blank page or a Chromium error instead of Orca.** Run with `--hs-debug` and look in `logs/session-*.log` for `[console:3]` lines; attach them to an issue.
 - **Which version is installed?** `OrcaHS.app/Contents/MacOS/OrcaHS --version`
 
