@@ -43,3 +43,14 @@ test('parse fills a missing or foreign url with the origin root', () => {
   assert.equal(parsed[0].url, 'http://a.example:6768/')
   assert.equal(parsed[1].url, 'http://b.example/')
 })
+
+test('upsert keeps an existing label unless a new one is given', () => {
+  let list = upsert([], 'http://10.0.0.5:6768/#code=abc', 1, ' Linux box ')
+  assert.equal(list[0].label, 'Linux box')
+  assert.equal(list[0].url, 'http://10.0.0.5:6768/')
+  list = upsert(list, 'http://10.0.0.5:6768/', 2)
+  assert.equal(list[0].label, 'Linux box')
+  list = upsert(list, 'http://10.0.0.5:6768/', 3, 'Renamed')
+  assert.equal(list[0].label, 'Renamed')
+  assert.equal(upsert([], 'http://10.0.0.6:6768/', 1, 'x'.repeat(100))[0].label.length, 64)
+})
