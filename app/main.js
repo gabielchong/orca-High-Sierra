@@ -6,6 +6,7 @@ const { pathToFileURL } = require('url')
 const pkg = require('./package.json')
 const { resolvePairInput } = require('./pair-link')
 const { createClipboardPolicy } = require('./clipboard-policy')
+const { evaluateAddServer } = require('./add-server-policy')
 const servers = require('./servers-store')
 const { scrub, safeUrl, truncate } = require('./log-scrub')
 const { createNavPolicy } = require('./nav-policy')
@@ -377,6 +378,46 @@ function createWindow() {
     clipboard.writeText(text)
     log(`[clipboard] wrote ${text.length} chars`)
     return { ok: true }
+  })
+
+  // --- Add server from the page's own Settings form (Remote Orca Servers → Connect to a host).
+  // The upstream web client keeps one pairing per origin and would overwrite this server's; OrcaHS
+  // records the new server in its list and switches to it, after the owner confirms the destination
+  // (decoded from the pairing code in the main process, never taken from the page) in a native dialog.
+  let addServerDialogOpen = false
+  ipcMain.handle('orca-hs:add-server', async (event, payload) => {
+    const p = payload && typeof payload === 'object' ? payload : {}
+    const verdict = evaluateAddServer({
+      senderIsWindow: event.sender === wc,
+      frameIsMain: event.senderFrame === wc.mainFrame,
+      frameUrl: event.senderFrame ? event.senderFrame.url : '',
+      allowedOrigin: trustedOrigin,
+      input: p.input,
+      name: p.name
+    })
+    if (!verdict.ok) { log(`[add-server] denied: ${verdict.reason}`); return { ok: false, reason: verdict.reason } }
+    if (addServerDialogOpen) return { ok: false, reason: 'another add-server request is waiting for confirmation' }
+    addServerDialogOpen = true
+    let response = 1
+    try {
+      const current = new URL(trustedOrigin).host
+      const named = verdict.label ? ` ("${verdict.label}")` : ''
+      ;({ response } = await dialog.showMessageBox(win, {
+        type: 'question',
+        buttons: ['Add and Switch', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        message: `Add Orca server ${verdict.host}?`,
+        detail: `${current} stays in the server list. OrcaHS switches to ${verdict.host}${named} now; switch back any time with Switch Server… (Cmd+Shift+S).`
+      }))
+    } catch (err) {
+      log(`[add-server] dialog failed: ${err && err.message}`)
+    } finally { addServerDialogOpen = false }
+    if (response !== 0) { log(`[add-server] declined ${verdict.host}`); return { ok: false, cancelled: true, reason: 'cancelled' } }
+    serverList = servers.upsert(serverList, verdict.url, Date.now(), verdict.label)
+    saveServers(serverList)
+    log(`[add-server] added ${verdict.host}`)
+    return connectTo(String(p.input), 'page')
   })
 
   // --- Debug aids: periodic screenshots and a fixed capability probe, only with --hs-debug.

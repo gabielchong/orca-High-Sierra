@@ -42,13 +42,14 @@ function parse(json) {
 }
 
 // `input` is any URL on the server (hash and query are dropped); one entry per origin.
-function upsert(list, input, now = Date.now()) {
+function upsert(list, input, now = Date.now(), label = null) {
   const o = normalizeOrigin(input)
   const url = launchUrlOf(input)
   if (!o || !url) return list
   const rest = list.filter((s) => s.origin !== o)
   const existing = list.find((s) => s.origin === o)
-  return sort([{ origin: o, url, label: existing ? existing.label : labelFor(o), lastUsedAt: now }, ...rest])
+  const wanted = typeof label === 'string' && label.trim() ? label.trim().slice(0, 64) : null
+  return sort([{ origin: o, url, label: wanted || (existing ? existing.label : labelFor(o)), lastUsedAt: now }, ...rest])
 }
 
 function remove(list, origin) {

@@ -1,16 +1,23 @@
 // Runs before page scripts in the sandboxed renderer.
 // 1. Installs polyfills for ES2024 APIs that Chromium 116 lacks but the upstream Orca renderer uses,
 //    and a URL shim for orca:// links (see installOrcaHsUrlShim).
-// 2. On insecure (plain http) origins, where Chromium removes navigator.clipboard entirely, installs a
+// 2. Routes the page's "Connect to a host" form to the OrcaHS server list (see add-server-policy.js).
+// 3. On insecure (plain http) origins, where Chromium removes navigator.clipboard entirely, installs a
 //    write-only shim: writeText goes through postMessage to this preload, then IPC to the main process,
 //    which enforces the policy in clipboard-policy.js. Reads are rejected; use Cmd+V.
-// 3. On the shell's own file:// pages only, exposes the small picker API (the main process re-checks
+// 4. On the shell's own file:// pages only, exposes the small picker API (the main process re-checks
 //    the exact page URL on every call).
 const { webFrame, ipcRenderer, contextBridge } = require('electron')
 
 const WRITE_CHANNEL = 'orca-hs:clipboard-write-text'
 const REQUEST = 'orca-hs:clipboard:request'
 const REPLY = 'orca-hs:clipboard:reply'
+// Page bridge: the trusted server's page may ask the shell for these, and nothing else. The main
+// process re-checks sender, frame and origin on every call.
+const PAGE_REQUEST = 'orca-hs:page:request'
+const PAGE_REPLY = 'orca-hs:page:reply'
+const PAGE_CHANNELS = new Set(['orca-hs:add-server'])
+const MAX_PAGE_PAYLOAD_LENGTH = 129 * 1024
 
 // url-shim:start
 // Chromium before 127 parses non-special schemes off-spec: `new URL('orca://pair?code=x')` yields
@@ -58,6 +65,7 @@ function installOrcaHsUrlShim(global) {
   return true
 }
 // url-shim:end
+
 
 const polyfills = `(() => {
   (${installOrcaHsUrlShim.toString()})(globalThis)
@@ -134,6 +142,70 @@ const polyfills = `(() => {
     Object.defineProperty(navigator, 'clipboard', { value: clipboard, configurable: true, enumerable: true })
     window.__orcaHsClipboardShim = 'write-only'
   }
+  // Settings → Remote Orca Servers → Connect to a host. The web client stores one pairing per
+  // origin, so adding another host from the page would overwrite this server's pairing. Adds for a
+  // different origin go to OrcaHS (native confirmation, server list, switch); same-origin adds and
+  // everything else on window.api pass through untouched. window.api is assigned by page scripts
+  // later, so an accessor wraps it on assignment. Upstream hands out a Proxy whose get trap stubs
+  // missing namespaces; wrapping with another delegating Proxy keeps that behaviour.
+  if (window.top === window && /^https?:$/.test(location.protocol)) {
+    const pendingAsks = new Map()
+    let askSeq = 0
+    window.addEventListener('message', (e) => {
+      if (e.source !== window || !e.data || e.data.type !== ${JSON.stringify(PAGE_REPLY)}) return
+      const resolve = pendingAsks.get(e.data.id)
+      if (!resolve) return
+      pendingAsks.delete(e.data.id)
+      resolve(e.data.result || { ok: false, reason: 'no result' })
+    })
+    const askShell = (channel, payload) => new Promise((resolve) => {
+      const id = ++askSeq
+      pendingAsks.set(id, resolve)
+      window.postMessage({ type: ${JSON.stringify(PAGE_REQUEST)}, id, channel, payload }, location.origin)
+    })
+    const targetOrigin = (input) => {
+      try {
+        let code = String(input).trim()
+        if (code.toLowerCase().startsWith('orca://')) {
+          const u = new URL(code)
+          code = u.searchParams.get('code') || (u.hash ? u.hash.slice(1) : '')
+        }
+        if (!code) return null
+        let b64 = code.replace(/-/g, '+').replace(/_/g, '/')
+        while (b64.length % 4) b64 += '='
+        const json = new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)))
+        const endpoint = new URL(JSON.parse(json).endpoint)
+        const protocol = endpoint.protocol === 'wss:' ? 'https:' : endpoint.protocol === 'ws:' ? 'http:' : endpoint.protocol
+        return protocol + '//' + endpoint.host
+      } catch { return null }
+    }
+    const wrapEnvironments = (envs) => new Proxy(envs, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver)
+        if (prop !== 'verifyAndAddFromPairingCode' || typeof value !== 'function') return value
+        return async (args) => {
+          const pairingCode = args && args.pairingCode
+          const origin = targetOrigin(pairingCode)
+          if (!origin || origin === location.origin) return value(args)
+          const reply = await askShell('orca-hs:add-server', { name: String((args && args.name) || ''), input: String(pairingCode) })
+          if (reply.ok) return new Promise(() => {}) // OrcaHS is navigating to the new server
+          const message = reply.cancelled ? 'Cancelled in OrcaHS.' : 'OrcaHS could not add this server: ' + (reply.reason || 'unknown error')
+          return { ok: false, kind: 'connection-interrupted', message }
+        }
+      }
+    })
+    const wrapApi = (api) => (api && typeof api === 'object')
+      ? new Proxy(api, {
+        get(target, prop, receiver) {
+          const value = Reflect.get(target, prop, receiver)
+          return prop === 'runtimeEnvironments' && value && typeof value === 'object' ? wrapEnvironments(value) : value
+        }
+      })
+      : api
+    let apiValue
+    Object.defineProperty(window, 'api', { configurable: true, enumerable: true, get: () => apiValue, set: (v) => { apiValue = wrapApi(v) } })
+    window.__orcaHsAddServerBridge = true
+  }
   window.__orcaHsPolyfills = true
 })()`
 
@@ -158,6 +230,27 @@ if (window.top === window) {
       }
     }
     window.postMessage({ type: REPLY, id: data.id, ok: !!(result && result.ok), reason: result && result.reason }, window.location.origin)
+  })
+  // Page bridge requests (add server). Only allow-listed channels are forwarded; the
+  // main process re-checks sender, frame, trusted origin and the payload itself.
+  window.addEventListener('message', async (e) => {
+    if (e.source !== window || e.origin !== window.location.origin) return
+    const data = e.data
+    if (!data || data.type !== PAGE_REQUEST || typeof data.id !== 'number' || typeof data.channel !== 'string') return
+    let result
+    if (!PAGE_CHANNELS.has(data.channel)) {
+      result = { ok: false, reason: 'unknown channel' }
+    } else if (JSON.stringify(data.payload === undefined ? null : data.payload).length > MAX_PAGE_PAYLOAD_LENGTH) {
+      result = { ok: false, reason: 'payload too long' }
+    } else {
+      try {
+        result = await ipcRenderer.invoke(data.channel, data.payload)
+      } catch (err) {
+        result = { ok: false, reason: String(err && err.message) }
+      }
+    }
+    const safe = result && typeof result === 'object' ? result : { ok: false, reason: 'no result' }
+    window.postMessage({ type: PAGE_REPLY, id: data.id, result: safe }, window.location.origin)
   })
 }
 
