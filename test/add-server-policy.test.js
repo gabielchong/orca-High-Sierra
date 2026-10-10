@@ -1,6 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { evaluateAddServer } = require('../app/add-server-policy')
+const { evaluateAddServer, evaluatePageSender, evaluatePageServerAction } = require('../app/add-server-policy')
 
 const code = (payload) => Buffer.from(JSON.stringify(payload)).toString('base64url')
 const remote = `orca://pair?code=${code({ endpoint: 'ws://10.0.0.5:6768', scope: 'runtime' })}`
@@ -37,3 +37,30 @@ test('add-server: rejects same-origin, non-runtime, unpaired, empty and oversize
   assert.equal(evaluateAddServer({ ...good, input: 'orca://pair?code=XXX' }).ok, false)
 })
 
+const servers = [
+  { origin: 'http://192.168.1.11:6768', url: 'http://192.168.1.11:6768/', label: 'macbookpro', lastUsedAt: 2 },
+  { origin: 'http://10.0.0.5:6768', url: 'http://10.0.0.5:6768/', label: 'Linux box', lastUsedAt: 1 }
+]
+const sender = { senderIsWindow: true, frameIsMain: true, frameUrl: 'http://192.168.1.11:6768/settings', allowedOrigin: 'http://192.168.1.11:6768' }
+
+test('page sender: trusted server page in the main frame only', () => {
+  assert.deepEqual(evaluatePageSender(sender), { ok: true, origin: 'http://192.168.1.11:6768' })
+  assert.equal(evaluatePageSender({ ...sender, senderIsWindow: false }).ok, false)
+  assert.equal(evaluatePageSender({ ...sender, frameIsMain: false }).ok, false)
+  assert.equal(evaluatePageSender({ ...sender, frameUrl: 'http://10.0.0.5:6768/' }).ok, false)
+  assert.equal(evaluatePageSender({ ...sender, allowedOrigin: null }).ok, false)
+})
+
+test('page server action: only known servers, and tells current from other', () => {
+  const other = evaluatePageServerAction({ ...sender, origin: 'http://10.0.0.5:6768', servers })
+  assert.equal(other.ok, true)
+  assert.equal(other.current, false)
+  assert.equal(other.server.url, 'http://10.0.0.5:6768/')
+  const current = evaluatePageServerAction({ ...sender, origin: 'http://192.168.1.11:6768/', servers })
+  assert.equal(current.ok, true)
+  assert.equal(current.current, true)
+  assert.match(evaluatePageServerAction({ ...sender, origin: 'http://evil.example:6768', servers }).reason, /not a known/)
+  assert.match(evaluatePageServerAction({ ...sender, origin: 'nonsense', servers }).reason, /invalid origin/)
+  assert.equal(evaluatePageServerAction({ ...sender, frameIsMain: false, origin: 'http://10.0.0.5:6768', servers }).ok, false)
+  assert.equal(evaluatePageServerAction({ ...sender, origin: 'http://10.0.0.5:6768', servers: [] }).ok, false)
+})

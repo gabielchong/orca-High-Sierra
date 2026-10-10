@@ -1,7 +1,8 @@
 // Runs before page scripts in the sandboxed renderer.
 // 1. Installs polyfills for ES2024 APIs that Chromium 116 lacks but the upstream Orca renderer uses,
 //    and a URL shim for orca:// links (see installOrcaHsUrlShim).
-// 2. Routes the page's "Connect to a host" form to the OrcaHS server list (see add-server-policy.js).
+// 2. Routes the page's "Connect to a host" form to the OrcaHS server list (see add-server-policy.js)
+//    and draws the "Servers on this Mac" card under Settings → Remote Orca Servers.
 // 3. On insecure (plain http) origins, where Chromium removes navigator.clipboard entirely, installs a
 //    write-only shim: writeText goes through postMessage to this preload, then IPC to the main process,
 //    which enforces the policy in clipboard-policy.js. Reads are rejected; use Cmd+V.
@@ -16,7 +17,7 @@ const REPLY = 'orca-hs:clipboard:reply'
 // process re-checks sender, frame and origin on every call.
 const PAGE_REQUEST = 'orca-hs:page:request'
 const PAGE_REPLY = 'orca-hs:page:reply'
-const PAGE_CHANNELS = new Set(['orca-hs:add-server'])
+const PAGE_CHANNELS = new Set(['orca-hs:add-server', 'orca-hs:page-servers', 'orca-hs:page-switch', 'orca-hs:page-remove'])
 const MAX_PAGE_PAYLOAD_LENGTH = 129 * 1024
 
 // url-shim:start
@@ -66,6 +67,118 @@ function installOrcaHsUrlShim(global) {
 }
 // url-shim:end
 
+// servers-card:start
+// Draws "Servers on this Mac" under Settings → Remote Orca Servers. The upstream web client lists
+// one server per origin; this card lists every server this Mac has paired with (OrcaHS's own list,
+// the same one behind Switch Server…). Switching reloads the window on that server. Mounted next to
+// the upstream pane whenever it is in the DOM, removed when it goes; if the anchor is not found the
+// card simply never shows. Runs in the page's main world with no access beyond askShell.
+function installOrcaHsServersCard(askShell) {
+  const ANCHOR = '[data-settings-section="remote-server-updates"]'
+  const ROOT_ID = 'orca-hs-servers-card'
+  let busy = false
+
+  const el = (tag, className, text) => {
+    const node = document.createElement(tag)
+    if (className) node.className = className
+    if (text !== undefined) node.textContent = text
+    return node
+  }
+  const buttonClass = (pane) => {
+    const sample = pane.querySelector('button.text-xs, button[class*="ghost"], button')
+    return sample && /inline-flex/.test(sample.className) ? sample.className : 'inline-flex items-center gap-1.5 rounded-md border border-border/60 px-2 py-1 text-xs hover:bg-muted/40'
+  }
+  const whenText = (ts) => {
+    if (!ts) return ''
+    try { return 'last used ' + new Date(ts).toLocaleString() } catch { return '' }
+  }
+
+  async function render(card, pane) {
+    card.replaceChildren()
+    const head = el('div', 'flex items-center justify-between gap-3 px-4 py-3')
+    const titles = el('div', 'min-w-0 space-y-0.5')
+    titles.append(el('div', 'text-sm font-medium', 'Servers on this Mac'))
+    titles.append(el('p', 'text-xs text-muted-foreground', 'Every Orca server this Mac has paired with. Switching reloads this window on that server; the same list is behind Switch Server… (⌘⇧S).'))
+    head.append(titles)
+    card.append(head)
+    const list = el('div', 'divide-y divide-border/50 border-t border-border/50')
+    card.append(list)
+    const reply = await askShell('orca-hs:page-servers', null)
+    if (!reply.ok) { list.append(el('div', 'px-4 py-3 text-xs text-destructive', 'OrcaHS could not read the server list: ' + (reply.reason || 'unknown error'))); return }
+    if (!reply.servers.length) { list.append(el('div', 'px-4 py-3 text-sm text-muted-foreground', 'No servers saved.')); return }
+    const btnClass = buttonClass(pane)
+    for (const s of reply.servers) {
+      let host = s.origin
+      try { host = new URL(s.origin).host } catch {}
+      const row = el('div', 'flex items-center gap-3 px-4 py-3')
+      const body = el('div', 'min-w-0 flex-1')
+      const line = el('div', 'flex min-w-0 items-center gap-2')
+      line.append(el('div', 'truncate text-sm font-medium', s.label || host))
+      if (s.current) line.append(el('span', 'rounded-full bg-muted px-1.5 text-[11px] text-muted-foreground', 'Current'))
+      body.append(line)
+      body.append(el('p', 'truncate text-xs text-muted-foreground', host + (s.lastUsedAt ? ' · ' + whenText(s.lastUsedAt) : '')))
+      row.append(body)
+      const actions = el('div', 'flex shrink-0 items-center gap-1')
+      if (!s.current) {
+        const sw = el('button', btnClass, 'Switch')
+        sw.type = 'button'
+        sw.addEventListener('click', async () => {
+          if (busy) return
+          busy = true; sw.disabled = true; sw.textContent = 'Switching…'
+          const r = await askShell('orca-hs:page-switch', s.origin)
+          if (!r.ok) { busy = false; sw.disabled = false; sw.textContent = 'Switch'; alert('OrcaHS could not switch: ' + (r.reason || 'unknown error')) }
+        })
+        actions.append(sw)
+      }
+      const rm = el('button', btnClass, 'Remove')
+      rm.type = 'button'
+      rm.addEventListener('click', async () => {
+        if (busy) return
+        busy = true; rm.disabled = true
+        const r = await askShell('orca-hs:page-remove', s.origin)
+        busy = false
+        if (r.ok) { render(card, pane); return }
+        rm.disabled = false
+        if (!r.cancelled) alert('OrcaHS could not remove this server: ' + (r.reason || 'unknown error'))
+      })
+      actions.append(rm)
+      row.append(actions)
+      list.append(row)
+    }
+  }
+
+  function sync() {
+    const anchor = document.querySelector(ANCHOR)
+    const pane = anchor ? anchor.parentElement : null
+    const existing = document.getElementById(ROOT_ID)
+    if (!pane) { if (existing) existing.remove(); return }
+    if (existing && existing.previousElementSibling === pane) {
+      existing.classList.toggle('hidden', pane.classList.contains('hidden'))
+      return
+    }
+    if (existing) existing.remove()
+    const card = el('div', 'mt-3 rounded-lg border border-border/50 bg-card/30')
+    card.id = ROOT_ID
+    card.setAttribute('data-orca-hs', 'servers-card')
+    pane.insertAdjacentElement('afterend', card)
+    card.classList.toggle('hidden', pane.classList.contains('hidden'))
+    render(card, pane)
+  }
+
+  const start = () => {
+    sync()
+    let scheduled = false
+    const observer = new MutationObserver(() => {
+      if (scheduled) return
+      scheduled = true
+      requestAnimationFrame(() => { scheduled = false; sync() })
+    })
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] })
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true })
+  else start()
+}
+// servers-card:end
 
 const polyfills = `(() => {
   (${installOrcaHsUrlShim.toString()})(globalThis)
@@ -205,6 +318,7 @@ const polyfills = `(() => {
     let apiValue
     Object.defineProperty(window, 'api', { configurable: true, enumerable: true, get: () => apiValue, set: (v) => { apiValue = wrapApi(v) } })
     window.__orcaHsAddServerBridge = true
+    ;(${installOrcaHsServersCard.toString()})(askShell)
   }
   window.__orcaHsPolyfills = true
 })()`
@@ -231,7 +345,7 @@ if (window.top === window) {
     }
     window.postMessage({ type: REPLY, id: data.id, ok: !!(result && result.ok), reason: result && result.reason }, window.location.origin)
   })
-  // Page bridge requests (add server). Only allow-listed channels are forwarded; the
+  // Page bridge requests (add server, servers card). Only allow-listed channels are forwarded; the
   // main process re-checks sender, frame, trusted origin and the payload itself.
   window.addEventListener('message', async (e) => {
     if (e.source !== window || e.origin !== window.location.origin) return

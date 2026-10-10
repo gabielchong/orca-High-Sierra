@@ -6,7 +6,7 @@ const { pathToFileURL } = require('url')
 const pkg = require('./package.json')
 const { resolvePairInput } = require('./pair-link')
 const { createClipboardPolicy } = require('./clipboard-policy')
-const { evaluateAddServer } = require('./add-server-policy')
+const { evaluateAddServer, evaluatePageSender, evaluatePageServerAction } = require('./add-server-policy')
 const servers = require('./servers-store')
 const { scrub, safeUrl, truncate } = require('./log-scrub')
 const { createNavPolicy } = require('./nav-policy')
@@ -342,10 +342,8 @@ function createWindow() {
     return !!isOurs && event.senderFrame === sender.mainFrame && navPolicy.isShellPage(event.senderFrame.url)
   }
   ipcMain.handle('orca-hs:servers-list', (event) => (fromShellPage(event) ? serverList : []))
-  ipcMain.handle('orca-hs:servers-remove', async (event, origin) => {
-    if (!fromShellPage(event)) return { ok: false, reason: 'not allowed' }
-    const o = servers.normalizeOrigin(origin)
-    if (!o) return { ok: false, reason: 'invalid origin' }
+  // Removes a server from the list and clears its stored pairing (the web client's localStorage).
+  async function removeServer(o) {
     let cleared = true
     try { await ses.clearStorageData({ origin: o }) } catch (err) { cleared = false; log(`[servers] clearStorageData failed: ${err && err.message}`) }
     serverList = servers.remove(serverList, o)
@@ -355,6 +353,12 @@ function createWindow() {
     if (!cleared) return { ok: false, reason: 'removed from the list, but clearing its stored pairing failed; try again' }
     if (!saved) return { ok: false, reason: 'pairing cleared, but saving the server list failed' }
     return { ok: true }
+  }
+  ipcMain.handle('orca-hs:servers-remove', async (event, origin) => {
+    if (!fromShellPage(event)) return { ok: false, reason: 'not allowed' }
+    const o = servers.normalizeOrigin(origin)
+    if (!o) return { ok: false, reason: 'invalid origin' }
+    return removeServer(o)
   })
   ipcMain.handle('orca-hs:connect', (event, input) => (fromShellPage(event) ? connectTo(String(input), 'picker') : { ok: false, reason: 'not allowed' }))
   ipcMain.handle('orca-hs:retry', (event) => (fromShellPage(event) ? retry() : { ok: false, reason: 'not allowed' }))
@@ -418,6 +422,59 @@ function createWindow() {
     saveServers(serverList)
     log(`[add-server] added ${verdict.host}`)
     return connectTo(String(p.input), 'page')
+  })
+
+  // --- "Servers on this Mac" card that the preload draws under Settings → Remote Orca Servers.
+  // The web client lists one server per origin; this card shows OrcaHS's list and switches by
+  // reloading the window on the chosen server. Same sender rules as the clipboard bridge.
+  function pageSender(event) {
+    return {
+      senderIsWindow: event.sender === wc,
+      frameIsMain: event.senderFrame === wc.mainFrame,
+      frameUrl: event.senderFrame ? event.senderFrame.url : '',
+      allowedOrigin: trustedOrigin
+    }
+  }
+  ipcMain.handle('orca-hs:page-servers', (event) => {
+    const sender = evaluatePageSender(pageSender(event))
+    if (!sender.ok) return { ok: false, reason: sender.reason }
+    return {
+      ok: true,
+      servers: servers.sort(serverList).map((s) => ({ origin: s.origin, label: s.label, lastUsedAt: s.lastUsedAt, current: s.origin === trustedOrigin }))
+    }
+  })
+  ipcMain.handle('orca-hs:page-switch', (event, origin) => {
+    const v = evaluatePageServerAction({ ...pageSender(event), origin, servers: serverList })
+    if (!v.ok) { log(`[page-switch] denied: ${v.reason}`); return { ok: false, reason: v.reason } }
+    if (v.current) return { ok: false, reason: 'already connected to this server' }
+    return connectTo(v.server.url, 'settings')
+  })
+  let removeDialogOpen = false
+  ipcMain.handle('orca-hs:page-remove', async (event, origin) => {
+    const v = evaluatePageServerAction({ ...pageSender(event), origin, servers: serverList })
+    if (!v.ok) { log(`[page-remove] denied: ${v.reason}`); return { ok: false, reason: v.reason } }
+    if (removeDialogOpen) return { ok: false, reason: 'another remove request is waiting for confirmation' }
+    removeDialogOpen = true
+    let response = 1
+    try {
+      const host = new URL(v.server.origin).host
+      ;({ response } = await dialog.showMessageBox(win, {
+        type: 'warning',
+        buttons: ['Remove', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        message: `Remove ${v.server.label}${v.server.label === host ? '' : ` (${host})`} from this Mac?`,
+        detail: v.current
+          ? 'This is the server you are connected to. Its stored pairing on this Mac is cleared and OrcaHS returns to the server picker. Pair again with a new link to come back.'
+          : 'Its stored pairing on this Mac is cleared. Pair again with a new link to come back.'
+      }))
+    } catch (err) {
+      log(`[page-remove] dialog failed: ${err && err.message}`)
+    } finally { removeDialogOpen = false }
+    if (response !== 0) return { ok: false, cancelled: true, reason: 'cancelled' }
+    const result = await removeServer(v.server.origin)
+    if (v.current) showPrompt()
+    return result
   })
 
   // --- Debug aids: periodic screenshots and a fixed capability probe, only with --hs-debug.
