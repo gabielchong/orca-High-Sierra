@@ -1,5 +1,6 @@
 // Runs before page scripts in the sandboxed renderer.
-// 1. Installs polyfills for ES2024 APIs that Chromium 116 lacks but the upstream Orca renderer uses.
+// 1. Installs polyfills for ES2024 APIs that Chromium 116 lacks but the upstream Orca renderer uses,
+//    and a URL shim for orca:// links (see installOrcaHsUrlShim).
 // 2. On insecure (plain http) origins, where Chromium removes navigator.clipboard entirely, installs a
 //    write-only shim: writeText goes through postMessage to this preload, then IPC to the main process,
 //    which enforces the policy in clipboard-policy.js. Reads are rejected; use Cmd+V.
@@ -11,7 +12,55 @@ const WRITE_CHANNEL = 'orca-hs:clipboard-write-text'
 const REQUEST = 'orca-hs:clipboard:request'
 const REPLY = 'orca-hs:clipboard:reply'
 
+// url-shim:start
+// Chromium before 127 parses non-special schemes off-spec: `new URL('orca://pair?code=x')` yields
+// host '' and pathname '//pair'. The upstream Orca web client requires `hostname === 'pair'` on
+// orca://pair links, so a full link pasted into Settings → Remote Orca Servers is rejected with
+// "Enter an Orca access link or bare pairing code" while the bare code works. Installed only when
+// the engine misparses: the authority is re-parsed through http: and the accessors overridden.
+function installOrcaHsUrlShim(global) {
+  const Native = global.URL
+  try { if (new Native('orca://pair?x=1').hostname === 'pair') return false } catch { return false }
+  const SPECIAL = /^(?:https?|wss?|ftp|file):$/i
+  const define = (target, name, get, set) =>
+    Object.defineProperty(target, name, { get, set: set || (() => {}), enumerable: true, configurable: true })
+  class URL extends Native {
+    constructor(input, base) {
+      super(input, base)
+      const scheme = this.protocol
+      if (SPECIAL.test(scheme) || this.host !== '' || !String(this.pathname).startsWith('//')) return
+      const rest = this.href.slice(scheme.length) // "//pair?code=…"
+      const authority = rest.slice(2).split(/[/?#]/)[0]
+      if (!authority) return
+      let fixed
+      try { fixed = new Native('http:' + rest) } catch { return }
+      if (fixed.username || fixed.password) return
+      const hasPath = rest.slice(2 + authority.length).startsWith('/')
+      const pathname = () => (hasPath ? fixed.pathname : '')
+      define(this, 'protocol', () => scheme)
+      define(this, 'origin', () => 'null')
+      define(this, 'host', () => fixed.host, (v) => { fixed.host = v })
+      define(this, 'hostname', () => fixed.hostname, (v) => { fixed.hostname = v })
+      define(this, 'port', () => fixed.port, (v) => { fixed.port = v })
+      define(this, 'pathname', pathname, (v) => { fixed.pathname = v })
+      define(this, 'search', () => fixed.search, (v) => { fixed.search = v })
+      define(this, 'searchParams', () => fixed.searchParams)
+      define(this, 'hash', () => fixed.hash, (v) => { fixed.hash = v })
+      define(this, 'href', () => `${scheme}//${fixed.host}${pathname()}${fixed.search}${fixed.hash}`)
+    }
+    toString() { return this.href }
+    toJSON() { return this.href }
+  }
+  for (const key of ['createObjectURL', 'revokeObjectURL', 'canParse']) {
+    if (typeof Native[key] === 'function') URL[key] = Native[key].bind(Native)
+  }
+  global.URL = URL
+  return true
+}
+// url-shim:end
+
 const polyfills = `(() => {
+  (${installOrcaHsUrlShim.toString()})(globalThis)
   if (typeof Promise.withResolvers !== 'function') {
     Promise.withResolvers = function () {
       let resolve, reject
